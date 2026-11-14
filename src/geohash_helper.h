@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013-2014, yinqiwen <yinqiwen@gmail.com>
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>.
- * Copyright (c) 2015, Salvatore Sanfilippo <antirez@gmail.com>.
+ * Copyright (c) 2015-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -47,7 +47,6 @@ typedef struct {
     GeoHashNeighbors neighbors;
 } GeoHashRadius;
 
-int GeoHashBitsComparator(const GeoHashBits *a, const GeoHashBits *b);
 uint8_t geohashEstimateStepsByRadius(double range_meters, double lat);
 int geohashBoundingBox(GeoShape *shape, double *bounds);
 GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape);

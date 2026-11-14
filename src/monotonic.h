@@ -24,13 +24,28 @@ typedef uint64_t monotime;
 /* Retrieve counter of micro-seconds relative to an arbitrary point in time.  */
 extern monotime (*getMonotonicUs)(void);
 
+typedef enum monotonic_clock_type {
+    MONOTONIC_CLOCK_POSIX,
+    MONOTONIC_CLOCK_HW,
+} monotonic_clock_type;
 
 /* Call once at startup to initialize the monotonic clock.  Though this only
  * needs to be called once, it may be called additional times without impact.
  * Returns a printable string indicating the type of clock initialized.
- * (The returned string is static and doesn't need to be freed.)  */
-const char * monotonicInit();
+ * (The returned string is static and doesn't need to be freed.)
+ *
+ * 'logger' is a printf-alike used to report notes from the clock detection
+ * and calibration fallback paths (e.g. an unconfirmed TSC rate); the server
+ * passes a serverLog() wrapper.  Pass NULL to discard those notes -- nothing
+ * is written to stderr, as this file is linked into every binary and some
+ * callers treat any child stderr output as failure.  */
+const char *monotonicInit(void (*logger)(const char *fmt, ...));
 
+/* Return a string indicating the type of monotonic clock being used. */
+const char *monotonicInfoString(void);
+
+/* Return the type of monotonic clock being used. */
+monotonic_clock_type monotonicGetType(void);
 
 /* Functions to measure elapsed time.  Example:
  *     monotime myTimer;

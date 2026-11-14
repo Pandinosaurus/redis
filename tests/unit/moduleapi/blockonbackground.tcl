@@ -1,8 +1,10 @@
 set testmodule [file normalize tests/modules/blockonbackground.so]
 
-source tests/support/util.tcl
+proc latency_percentiles_usec {cmd} {
+    return [latencyrstat_percentiles $cmd r]
+}
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test { blocked clients time tracking - check blocked command that uses RedisModule_BlockedClientMeasureTimeStart() is tracking background time} {
@@ -16,16 +18,21 @@ start_server {tags {"modules"}} {
             assert_equal [r slowlog len] 0
         }
         r config resetstat
+        r config set latency-tracking yes
+        r config set latency-tracking-info-percentiles "50.0"
         r block.debug 200 10000
         if {!$::no_latency} {
             assert_equal [r slowlog len] 1
         }
 
         set cmdstatline [cmdrstat block.debug r]
+        set latencystatline_debug [latency_percentiles_usec block.debug]
 
-        regexp "calls=1,usec=(.*?),usec_per_call=(.*?),rejected_calls=0,failed_calls=0" $cmdstatline usec usec_per_call
+        regexp "calls=1,usec=(.*?),usec_per_call=(.*?),rejected_calls=0,failed_calls=0" $cmdstatline -> usec usec_per_call
+        regexp "p50=(.+\..+)" $latencystatline_debug  -> p50
         assert {$usec >= 100000}
         assert {$usec_per_call >= 100000}
+        assert {$p50 >= 100000}
     }
 
     test { blocked clients time tracking - check blocked command that uses RedisModule_BlockedClientMeasureTimeStart() is tracking background time even in timeout } {
@@ -84,5 +91,34 @@ start_server {tags {"modules"}} {
         if {!$::no_latency} {
             assert_equal [r slowlog len] 0
         }
+    }
+
+    test "client unblock works only for modules with timeout support" {
+        set rd [redis_deferring_client]
+        $rd client id
+        set id [$rd read]
+
+        # Block with a timeout function - may unblock
+        $rd block.block 20000
+        wait_for_condition 50 100 {
+            [r block.is_blocked] == 1
+        } else {
+            fail "Module did not block"
+        }
+
+        assert_equal 1 [r client unblock $id]
+        assert_match {*Timed out*} [$rd read]
+
+        # Block without a timeout function - cannot unblock
+        $rd block.block 0
+        wait_for_condition 50 100 {
+            [r block.is_blocked] == 1
+        } else {
+            fail "Module did not block"
+        }
+
+        assert_equal 0 [r client unblock $id]
+        assert_equal "OK" [r block.release foobar]
+        assert_equal "foobar" [$rd read]
     }
 }

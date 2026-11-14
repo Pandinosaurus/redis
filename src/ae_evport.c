@@ -28,7 +28,6 @@
  */
 
 
-#include <assert.h>
 #include <errno.h>
 #include <port.h>
 #include <poll.h>
@@ -217,7 +216,9 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask) {
      * the fact that our caller has already updated the mask in the eventLoop.
      */
 
-    fullmask = eventLoop->events[fd].mask;
+    /* We always remove the specified events from the current mask,
+     * regardless of whether eventLoop->events[fd].mask has been updated yet. */
+    fullmask = eventLoop->events[fd].mask & ~mask;
     if (fullmask == AE_NONE) {
         /*
          * We're removing *all* events, so use port_dissociate to remove the
@@ -291,8 +292,7 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
             return 0;
 
         /* Any other error indicates a bug. */
-        perror("aeApiPoll: port_get");
-        abort();
+        panic("aeApiPoll: port_getn, %s", strerror(errno));
     }
 
     state->npending = nevents;

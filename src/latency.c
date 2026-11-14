@@ -5,39 +5,20 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2014, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2014-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
+#include "hdr_histogram.h"
 
 /* Dictionary type for latency events. */
-int dictStringKeyCompare(void *privdata, const void *key1, const void *key2) {
-    UNUSED(privdata);
+int dictStringKeyCompare(dictCmpCache *cache, const void *key1, const void *key2) {
+    UNUSED(cache);
     return strcmp(key1,key2) == 0;
 }
 
@@ -45,7 +26,7 @@ uint64_t dictStringHash(const void *key) {
     return dictGenHashFunction(key, strlen(key));
 }
 
-void dictVanillaFree(void *privdata, void *val);
+void dictVanillaFree(dict *d, void *val);
 
 dictType latencyTimeSeriesDictType = {
     dictStringHash,             /* hash function */
@@ -58,39 +39,6 @@ dictType latencyTimeSeriesDictType = {
 };
 
 /* ------------------------- Utility functions ------------------------------ */
-
-#ifdef __linux__
-#include <sys/prctl.h>
-/* Returns 1 if Transparent Huge Pages support is enabled in the kernel.
- * Otherwise (or if we are unable to check) 0 is returned. */
-int THPIsEnabled(void) {
-    char buf[1024];
-
-    FILE *fp = fopen("/sys/kernel/mm/transparent_hugepage/enabled","r");
-    if (!fp) return 0;
-    if (fgets(buf,sizeof(buf),fp) == NULL) {
-        fclose(fp);
-        return 0;
-    }
-    fclose(fp);
-    return (strstr(buf,"[always]") != NULL) ? 1 : 0;
-}
-
-/* since linux-3.5, kernel supports to set the state of the "THP disable" flag
- * for the calling thread. PR_SET_THP_DISABLE is defined in linux/prctl.h */
-int THPDisable(void) {
-    int ret = -EINVAL;
-
-    if (!server.disable_thp)
-        return ret;
-
-#ifdef PR_SET_THP_DISABLE
-    ret = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
-
-    return ret;
-}
-#endif
 
 /* Report the amount of AnonHugePages in smap, in bytes. If the return
  * value of the function is non-zero, the process is being targeted by
@@ -105,7 +53,7 @@ int THPGetAnonHugePagesSize(void) {
  * of time series, each time series is created on demand in order to avoid
  * having a fixed list to maintain. */
 void latencyMonitorInit(void) {
-    server.latency_events = dictCreate(&latencyTimeSeriesDictType,NULL);
+    server.latency_events = dictCreate(&latencyTimeSeriesDictType);
 }
 
 /* Add the specified sample to the specified time series "event".
@@ -137,7 +85,7 @@ void latencyAddSample(const char *event, mstime_t latency) {
         return;
     }
 
-    ts->samples[ts->idx].time = time(NULL);
+    ts->samples[ts->idx].time = now;
     ts->samples[ts->idx].latency = latency;
 
     ts->idx++;
@@ -150,12 +98,12 @@ void latencyAddSample(const char *event, mstime_t latency) {
  * Note: this is O(N) even when event_to_reset is not NULL because makes
  * the code simpler and we have a small fixed max number of events. */
 int latencyResetEvent(char *event_to_reset) {
-    dictIterator *di;
+    dictIterator di;
     dictEntry *de;
     int resets = 0;
 
-    di = dictGetSafeIterator(server.latency_events);
-    while((de = dictNext(di)) != NULL) {
+    dictInitSafeIterator(&di, server.latency_events);
+    while((de = dictNext(&di)) != NULL) {
         char *event = dictGetKey(de);
 
         if (event_to_reset == NULL || strcasecmp(event,event_to_reset) == 0) {
@@ -163,7 +111,7 @@ int latencyResetEvent(char *event_to_reset) {
             resets++;
         }
     }
-    dictReleaseIterator(di);
+    dictResetIterator(&di);
     return resets;
 }
 
@@ -256,18 +204,18 @@ sds createLatencyReport(void) {
     if (dictSize(server.latency_events) == 0 &&
         server.latency_monitor_threshold == 0)
     {
-        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this Redis instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it. If we weren't in a deep space mission I'd suggest to take a look at https://redis.io/topics/latency-monitor.\n");
+        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this Redis instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it. If we weren't in a deep space mission I'd suggest to take a look at https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency-monitor.\n");
         return report;
     }
 
     /* Show all the events stats and add for each event some event-related
      * comment depending on the values. */
-    dictIterator *di;
+    dictIterator di;
     dictEntry *de;
     int eventnum = 0;
 
-    di = dictGetSafeIterator(server.latency_events);
-    while((de = dictNext(di)) != NULL) {
+    dictInitSafeIterator(&di, server.latency_events);
+    while((de = dictNext(&di)) != NULL) {
         char *event = dictGetKey(de);
         struct latencyTimeSeries *ts = dictGetVal(de);
         struct latencyStats ls;
@@ -311,7 +259,7 @@ sds createLatencyReport(void) {
 
         /* Potentially commands. */
         if (!strcasecmp(event,"command")) {
-            if (server.slowlog_log_slower_than < 0) {
+            if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) {
                 advise_slowlog_enabled = 1;
                 advices++;
             } else if (server.slowlog_log_slower_than/1000 >
@@ -395,7 +343,7 @@ sds createLatencyReport(void) {
 
         report = sdscatlen(report,"\n",1);
     }
-    dictReleaseIterator(di);
+    dictResetIterator(&di);
 
     /* Add non event based advices. */
     if (THPGetAnonHugePagesSize() > 0) {
@@ -445,7 +393,7 @@ sds createLatencyReport(void) {
         }
 
         if (advise_ssd) {
-            report = sdscat(report,"- SSD disks are able to reduce fsync latency, and total time needed for snapshotting and AOF log rewriting (resulting in smaller memory usage and smaller final AOF rewrite buffer flushes). With extremely high write load SSD disks can be a good option. However Redis should perform reasonably with high load using normal disks. Use this advice as a last resort.\n");
+            report = sdscat(report,"- SSD disks are able to reduce fsync latency, and total time needed for snapshotting and AOF log rewriting (resulting in smaller memory usage). With extremely high write load SSD disks can be a good option. However Redis should perform reasonably with high load using normal disks. Use this advice as a last resort.\n");
         }
 
         if (advise_data_writeback) {
@@ -490,6 +438,96 @@ sds createLatencyReport(void) {
 
 /* ---------------------- Latency command implementation -------------------- */
 
+/* latencyCommand() helper to produce a map of time buckets,
+ * each representing a latency range,
+ * between 1 nanosecond and roughly 1 second.
+ * Each bucket covers twice the previous bucket's range.
+ * Empty buckets are not printed.
+ * Everything above 1 sec is considered +Inf.
+ * At max there will be log2(1000000000)=30 buckets */
+void fillCommandCDF(client *c, struct hdr_histogram* histogram) {
+    addReplyMapLen(c,2);
+    addReplyBulkCString(c,"calls");
+    addReplyLongLong(c,(long long) histogram->total_count);
+    addReplyBulkCString(c,"histogram_usec");
+    void *replylen = addReplyDeferredLen(c);
+    int samples = 0;
+    struct hdr_iter iter;
+    hdr_iter_log_init(&iter,histogram,1024,2);
+    int64_t previous_count = 0;
+    while (hdr_iter_next(&iter)) {
+        const int64_t micros = iter.highest_equivalent_value / 1000;
+        const int64_t cumulative_count = iter.cumulative_count;
+        if(cumulative_count > previous_count){
+            addReplyLongLong(c,(long long) micros);
+            addReplyLongLong(c,(long long) cumulative_count);
+            samples++;
+        }
+        previous_count = cumulative_count;
+    }
+    setDeferredMapLen(c,replylen,samples);
+}
+
+/* latencyCommand() helper to produce for all commands,
+ * a per command cumulative distribution of latencies. */
+void latencyAllCommandsFillCDF(client *c, dict *commands, int *command_with_data) {
+    dictIterator di;
+    dictEntry *de;
+    struct redisCommand *cmd;
+
+    dictInitSafeIterator(&di, commands);
+    while((de = dictNext(&di)) != NULL) {
+        cmd = (struct redisCommand *) dictGetVal(de);
+        if (cmd->latency_histogram) {
+            addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
+            fillCommandCDF(c, cmd->latency_histogram);
+            (*command_with_data)++;
+        }
+
+        if (cmd->subcommands) {
+            latencyAllCommandsFillCDF(c, cmd->subcommands_dict, command_with_data);
+        }
+    }
+    dictResetIterator(&di);
+}
+
+/* latencyCommand() helper to produce for a specific command set,
+ * a per command cumulative distribution of latencies. */
+void latencySpecificCommandsFillCDF(client *c) {
+    void *replylen = addReplyDeferredLen(c);
+    int command_with_data = 0;
+    for (int j = 2; j < c->argc; j++){
+        struct redisCommand *cmd = lookupCommandBySds(c->argv[j]->ptr);
+        /* If the command does not exist we skip the reply */
+        if (cmd == NULL) {
+            continue;
+        }
+
+        if (cmd->latency_histogram) {
+            addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
+            fillCommandCDF(c, cmd->latency_histogram);
+            command_with_data++;
+        }
+
+        if (cmd->subcommands_dict) {
+            dictEntry *de;
+            dictIterator di;
+
+            dictInitSafeIterator(&di, cmd->subcommands_dict);
+            while ((de = dictNext(&di)) != NULL) {
+                struct redisCommand *sub = dictGetVal(de);
+                if (sub->latency_histogram) {
+                    addReplyBulkCBuffer(c, sub->fullname, sdslen(sub->fullname));
+                    fillCommandCDF(c, sub->latency_histogram);
+                    command_with_data++;
+                }
+            }
+            dictResetIterator(&di);
+        }
+    }
+    setDeferredMapLen(c,replylen,command_with_data);
+}
+
 /* latencyCommand() helper to produce a time-delay reply for all the samples
  * in memory for the specified time series. */
 void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
@@ -511,12 +549,12 @@ void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
 /* latencyCommand() helper to produce the reply for the LATEST subcommand,
  * listing the last latency sample for every event type registered so far. */
 void latencyCommandReplyWithLatestEvents(client *c) {
-    dictIterator *di;
+    dictIterator di;
     dictEntry *de;
 
     addReplyArrayLen(c,dictSize(server.latency_events));
-    di = dictGetIterator(server.latency_events);
-    while((de = dictNext(di)) != NULL) {
+    dictInitIterator(&di, server.latency_events);
+    while((de = dictNext(&di)) != NULL) {
         char *event = dictGetKey(de);
         struct latencyTimeSeries *ts = dictGetVal(de);
         int last = (ts->idx + LATENCY_TS_LEN - 1) % LATENCY_TS_LEN;
@@ -527,7 +565,7 @@ void latencyCommandReplyWithLatestEvents(client *c) {
         addReplyLongLong(c,ts->samples[last].latency);
         addReplyLongLong(c,ts->max);
     }
-    dictReleaseIterator(di);
+    dictResetIterator(&di);
 }
 
 #define LATENCY_GRAPH_COLS 80
@@ -582,6 +620,7 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
  * LATENCY DOCTOR: returns a human readable analysis of instance latency.
  * LATENCY GRAPH: provide an ASCII graph of the latency of the specified event.
  * LATENCY RESET: reset data of a specified event or all the data if no event provided.
+ * LATENCY HISTOGRAM: return a cumulative distribution of latencies in the format of an histogram for the specified command names.
  */
 void latencyCommand(client *c) {
     struct latencyTimeSeries *ts;
@@ -628,6 +667,16 @@ void latencyCommand(client *c) {
                 resets += latencyResetEvent(c->argv[j]->ptr);
             addReplyLongLong(c,resets);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"histogram") && c->argc >= 2) {
+        /* LATENCY HISTOGRAM*/
+        if (c->argc == 2) {
+            int command_with_data = 0;
+            void *replylen = addReplyDeferredLen(c);
+            latencyAllCommandsFillCDF(c, server.commands, &command_with_data);
+            setDeferredMapLen(c, replylen, command_with_data);
+        } else {
+            latencySpecificCommandsFillCDF(c);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
         const char *help[] = {
 "DOCTOR",
@@ -641,6 +690,9 @@ void latencyCommand(client *c) {
 "RESET [<event> ...]",
 "    Reset latency data of one or more <event> classes.",
 "    (default: reset all data for all event classes)",
+"HISTOGRAM [COMMAND ...]",
+"    Return a cumulative distribution of latencies in the format of a histogram for the specified command names.",
+"    If no commands are specified then all histograms are replied.",
 NULL
         };
         addReplyHelp(c, help);
@@ -656,3 +708,14 @@ nodataerr:
         "No samples available for event '%s'", (char*) c->argv[2]->ptr);
 }
 
+void durationAddSample(int type, monotime duration) {
+    if (type >= EL_DURATION_TYPE_NUM) {
+        return;
+    }
+    durationStats* ds = &server.duration_stats[type];
+    ds->cnt++;
+    ds->sum += duration;
+    if (duration > ds->max) {
+        ds->max = duration;
+    }
+}

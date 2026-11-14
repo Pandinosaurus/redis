@@ -1,4 +1,3 @@
-#define REDISMODULE_EXPERIMENTAL_API
 
 /* define macros for having usleep */
 #define _BSD_SOURCE
@@ -12,11 +11,11 @@
 #define UNUSED(V) ((void) V)
 
 int child_pid = -1;
-int exitted_with_code = -1;
+int exited_with_code = -1;
 
 void done_handler(int exitcode, int bysignal, void *user_data) {
     child_pid = -1;
-    exitted_with_code = exitcode;
+    exited_with_code = exitcode;
     assert(user_data==(void*)0xdeadbeef);
     UNUSED(bysignal);
 }
@@ -24,7 +23,8 @@ void done_handler(int exitcode, int bysignal, void *user_data) {
 int fork_create(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 {
     long long code_to_exit_with;
-    if (argc != 2) {
+    long long usleep_us;
+    if (argc != 3) {
         RedisModule_WrongArity(ctx);
         return REDISMODULE_OK;
     }
@@ -35,20 +35,22 @@ int fork_create(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     }
 
     RedisModule_StringToLongLong(argv[1], &code_to_exit_with);
-    exitted_with_code = -1;
-    child_pid = RedisModule_Fork(done_handler, (void*)0xdeadbeef);
-    if (child_pid < 0) {
+    RedisModule_StringToLongLong(argv[2], &usleep_us);
+    exited_with_code = -1;
+    int fork_child_pid = RedisModule_Fork(done_handler, (void*)0xdeadbeef);
+    if (fork_child_pid < 0) {
         RedisModule_ReplyWithError(ctx, "Fork failed");
         return REDISMODULE_OK;
-    } else if (child_pid > 0) {
+    } else if (fork_child_pid > 0) {
         /* parent */
+        child_pid = fork_child_pid;
         RedisModule_ReplyWithLongLong(ctx, child_pid);
         return REDISMODULE_OK;
     }
 
     /* child */
     RedisModule_Log(ctx, "notice", "fork child started");
-    usleep(500000);
+    usleep(usleep_us);
     RedisModule_Log(ctx, "notice", "fork child exiting");
     RedisModule_ExitFromChild(code_to_exit_with);
     /* unreachable */
@@ -59,7 +61,7 @@ int fork_exitcode(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 {
     UNUSED(argv);
     UNUSED(argc);
-    RedisModule_ReplyWithLongLong(ctx, exitted_with_code);
+    RedisModule_ReplyWithLongLong(ctx, exited_with_code);
     return REDISMODULE_OK;
 }
 

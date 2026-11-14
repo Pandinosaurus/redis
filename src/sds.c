@@ -1,72 +1,41 @@
 /* SDSLib 2.0 -- A C dynamic strings library
  *
- * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2015, Oran Agra
- * Copyright (c) 2015, Redis Labs, Inc
+ * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * 
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ * 
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <assert.h>
 #include <limits.h>
+#include "redisassert.h"
 #include "sds.h"
 #include "sdsalloc.h"
+#include "util.h"
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
-static inline int sdsHdrSize(char type) {
-    switch(type&SDS_TYPE_MASK) {
-        case SDS_TYPE_5:
-            return sizeof(struct sdshdr5);
-        case SDS_TYPE_8:
-            return sizeof(struct sdshdr8);
-        case SDS_TYPE_16:
-            return sizeof(struct sdshdr16);
-        case SDS_TYPE_32:
-            return sizeof(struct sdshdr32);
-        case SDS_TYPE_64:
-            return sizeof(struct sdshdr64);
-    }
-    return 0;
-}
-
-static inline char sdsReqType(size_t string_size) {
-    if (string_size < 1<<5)
-        return SDS_TYPE_5;
-    if (string_size < 1<<8)
-        return SDS_TYPE_8;
-    if (string_size < 1<<16)
-        return SDS_TYPE_16;
+/* Returns the minimum SDS type required to store a string of the given length.
+ * 
+ * Previously, the SDS type was determined solely by the logical string
+ * length, ignoring header size, which could lead to inconsistencies. If the 
+ * allocated buffer was larger than the maximum size supported by a type, `alloc` 
+ * would be truncated, creating a mismatch between `alloc` and the actual buffer size.
+ */
+char sdsReqType(size_t string_size) {
+    if (string_size < 1 << 5) return SDS_TYPE_5;
+    if (string_size <= (1 << 8) - sizeof(struct sdshdr8) - 1) return SDS_TYPE_8;
+    if (string_size <= (1 << 16) - sizeof(struct sdshdr16) - 1) return SDS_TYPE_16;
 #if (LONG_MAX == LLONG_MAX)
-    if (string_size < 1ll<<32)
-        return SDS_TYPE_32;
+    if (string_size <= (1ll << 32) - sizeof(struct sdshdr32) - 1) return SDS_TYPE_32;
     return SDS_TYPE_64;
 #else
     return SDS_TYPE_32;
@@ -87,12 +56,38 @@ static inline size_t sdsTypeMaxSize(char type) {
     return -1; /* this is equivalent to the max SDS_TYPE_64 or SDS_TYPE_32 */
 }
 
+/* 
+ * Adjusts the SDS type if the allocated buffer size exceeds the maximum size 
+ * addressable by the current type.
+ *
+ * The SDS type is initially determined based on the logical length of the string. 
+ * However, allocators like jemalloc may return a buffer larger than requested, 
+ * potentially exceeding the maximum size the selected SDS type can handle. This 
+ * can cause a mismatch between the `alloc` field and the actual buffer size, 
+ * leading to wasted memory and possible inconsistencies.
+ *
+ * This function ensures that the SDS type is selected based on the actual buffer 
+ * size rather than just the logical length. If the buffer size supports a larger 
+ * SDS type, it updates `type` and `hdrlen` accordingly.
+ *
+ * Returns 1 if the type was adjusted, 0 otherwise.
+ */
+static inline int adjustTypeIfNeeded(char *type, int *hdrlen, size_t bufsize) {
+    size_t usable = bufsize - *hdrlen - 1;
+    if (*type != SDS_TYPE_5 && usable > sdsTypeMaxSize(*type)) {
+        *type = sdsReqType(usable);
+        *hdrlen = sdsHdrSize(*type);
+        return 1;
+    }
+    return 0;
+}
+
 /* Create a new sds string with the content specified by the 'init' pointer
  * and 'initlen'.
  * If NULL is used for 'init' the string is initialized with zero bytes.
  * If SDS_NOINIT is used, the buffer is left uninitialized;
  *
- * The string is always null-termined (all the sds strings are, always) so
+ * The string is always null-terminated (all the sds strings are, always) so
  * even if you create an sds string with:
  *
  * mystring = sdsnewlen("abc",3);
@@ -102,29 +97,52 @@ static inline size_t sdsTypeMaxSize(char type) {
  * \0 characters in the middle, as the length is stored in the sds header. */
 sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
     void *sh;
-    sds s;
+
     char type = sdsReqType(initlen);
     /* Empty strings are usually created in order to append. Use type 8
      * since type 5 is not good at this. */
     if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
     int hdrlen = sdsHdrSize(type);
-    unsigned char *fp; /* flags pointer. */
-    size_t usable;
+    size_t bufsize;
 
-    assert(initlen + hdrlen + 1 > initlen); /* Catch size_t overflow */
+    if (trymalloc) {
+        /* protect against size_t overflow */
+        if (initlen + hdrlen + 1 <= initlen) 
+            return NULL;
+    } else {
+        assert(initlen + hdrlen + 1 > initlen); /* Catch size_t overflow */
+    }
+    
     sh = trymalloc?
-        s_trymalloc_usable(hdrlen+initlen+1, &usable) :
-        s_malloc_usable(hdrlen+initlen+1, &usable);
+        s_trymalloc_usable(hdrlen+initlen+1, &bufsize) :
+        s_malloc_usable(hdrlen+initlen+1, &bufsize);
     if (sh == NULL) return NULL;
-    if (init==SDS_NOINIT)
-        init = NULL;
-    else if (!init)
-        memset(sh, 0, hdrlen+initlen+1);
-    s = (char*)sh+hdrlen;
-    fp = ((unsigned char*)s)-1;
-    usable = usable-hdrlen-1;
-    if (usable > sdsTypeMaxSize(type))
-        usable = sdsTypeMaxSize(type);
+
+    adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+    return sdsnewplacement(sh, bufsize, type, init, initlen);
+}
+
+/* Initializes an SDS within pre-allocated buffer. Like, placement new in C++. 
+ * 
+ * Parameters:
+ * - `buf`    : A pre-allocated buffer for the SDS.
+ * - `bufsize`: Total size of the buffer (>= `sdsReqSize(initlen, type)`). Can use 
+ *              a larger `bufsize` than required, but usable size won't be greater 
+ *              than `sdsTypeMaxSize(type)`. 
+ * - `type`   : The SDS type. Can assist `sdsReqType(length)` to compute the type.
+ * - `init`   : Initial string to copy, or `SDS_NOINIT` to skip initialization.
+ * - `initlen`: Length of the initial string.
+ * 
+ * Returns:
+ * - A pointer to the SDS inside `buf`. 
+ */
+sds sdsnewplacement(char *buf, size_t bufsize, char type, const char *init, size_t initlen) {
+    assert(bufsize >= sdsReqSize(initlen, type));
+    int hdrlen = sdsHdrSize(type);
+    size_t usable = bufsize - hdrlen - 1;
+    sds s = buf + hdrlen;
+    unsigned char *fp = ((unsigned char *)s) - 1; /* flags pointer. */
+
     switch(type) {
         case SDS_TYPE_5: {
             *fp = type | (initlen << SDS_TYPE_BITS);
@@ -133,6 +151,7 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
         case SDS_TYPE_8: {
             SDS_HDR_VAR(8,s);
             sh->len = initlen;
+            debugAssert(usable <= sdsTypeMaxSize(type));
             sh->alloc = usable;
             *fp = type;
             break;
@@ -140,6 +159,7 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
         case SDS_TYPE_16: {
             SDS_HDR_VAR(16,s);
             sh->len = initlen;
+            debugAssert(usable <= sdsTypeMaxSize(type));
             sh->alloc = usable;
             *fp = type;
             break;
@@ -147,6 +167,7 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
         case SDS_TYPE_32: {
             SDS_HDR_VAR(32,s);
             sh->len = initlen;
+            debugAssert(usable <= sdsTypeMaxSize(type));
             sh->alloc = usable;
             *fp = type;
             break;
@@ -154,13 +175,19 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
         case SDS_TYPE_64: {
             SDS_HDR_VAR(64,s);
             sh->len = initlen;
+            debugAssert(usable <= sdsTypeMaxSize(type));
             sh->alloc = usable;
             *fp = type;
             break;
         }
     }
-    if (initlen && init)
+    if (init == SDS_NOINIT)
+        init = NULL;
+    else if (!init)
+        memset(s, 0, initlen);
+    else if (initlen) 
         memcpy(s, init, initlen);
+
     s[initlen] = '\0';
     return s;
 }
@@ -193,7 +220,19 @@ sds sdsdup(const sds s) {
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
-    s_free((char*)s-sdsHdrSize(s[-1]));
+    if (sdsType(s) == SDS_TYPE_5) {
+        /* TYPE_5 has no alloc field so sdsAllocSize() returns the requested
+         * size which may not match the actual allocation, so not suitable for
+         * s_free_with_size(). */
+        s_free(sdsAllocPtr(s));
+    } else {
+        s_free_with_size(sdsAllocPtr(s), sdsAllocSize(s));
+    }
+}
+
+/* Generic version of sdsfree. */
+void sdsfreegeneric(void *s) {
+    sdsfree((sds)s);
 }
 
 /* Set the sds string length to the length as obtained with strlen(), so
@@ -227,28 +266,37 @@ void sdsclear(sds s) {
 /* Enlarge the free space at the end of the sds string so that the caller
  * is sure that after calling this function can overwrite up to addlen
  * bytes after the end of the string, plus one more byte for nul term.
+ * If there's already sufficient free space, this function returns without any
+ * action, if there isn't sufficient free space, it'll allocate what's missing,
+ * and possibly more:
+ * When greedy is 1, enlarge more than needed, to avoid need for future reallocs
+ * on incremental growth.
+ * When greedy is 0, enlarge just enough so that there's free space for 'addlen'.
  *
  * Note: this does not change the *length* of the sds string as returned
  * by sdslen(), but only the free buffer space we have. */
-sds sdsMakeRoomFor(sds s, size_t addlen) {
+sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
     void *sh, *newsh;
     size_t avail = sdsavail(s);
-    size_t len, newlen;
-    char type, oldtype = s[-1] & SDS_TYPE_MASK;
+    size_t len, newlen, reqlen;
+    char type, oldtype = sdsType(s);
     int hdrlen;
-    size_t usable;
+    size_t bufsize, usable;
+    int use_realloc;
 
     /* Return ASAP if there is enough space left. */
     if (avail >= addlen) return s;
 
     len = sdslen(s);
     sh = (char*)s-sdsHdrSize(oldtype);
-    newlen = (len+addlen);
+    reqlen = newlen = (len+addlen);
     assert(newlen > len);   /* Catch size_t overflow */
-    if (newlen < SDS_MAX_PREALLOC)
-        newlen *= 2;
-    else
-        newlen += SDS_MAX_PREALLOC;
+    if (greedy == 1) {
+        if (newlen < SDS_MAX_PREALLOC)
+            newlen *= 2;
+        else
+            newlen += SDS_MAX_PREALLOC;
+    }
 
     type = sdsReqType(newlen);
 
@@ -258,27 +306,45 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
 
     hdrlen = sdsHdrSize(type);
-    assert(hdrlen + newlen + 1 > len);  /* Catch size_t overflow */
-    if (oldtype==type) {
-        newsh = s_realloc_usable(sh, hdrlen+newlen+1, &usable);
+    assert(hdrlen + newlen + 1 > reqlen);  /* Catch size_t overflow */
+    use_realloc = (oldtype == type);
+    if (use_realloc) {
+        newsh = s_realloc_usable(sh, hdrlen + newlen + 1, &bufsize, NULL);
         if (newsh == NULL) return NULL;
-        s = (char*)newsh+hdrlen;
+        s = (char*)newsh + hdrlen;
+        if (adjustTypeIfNeeded(&type, &hdrlen, bufsize)) {
+            memmove((char *)newsh + hdrlen, s, len + 1);
+            s = (char *)newsh + hdrlen;
+            s[-1] = type;
+            sdssetlen(s, len);
+        }
     } else {
         /* Since the header size changes, need to move the string forward,
          * and can't use realloc */
-        newsh = s_malloc_usable(hdrlen+newlen+1, &usable);
+        newsh = s_malloc_usable(hdrlen + newlen + 1, &bufsize);
         if (newsh == NULL) return NULL;
+        adjustTypeIfNeeded(&type, &hdrlen, bufsize);
         memcpy((char*)newsh+hdrlen, s, len+1);
         s_free(sh);
         s = (char*)newsh+hdrlen;
         s[-1] = type;
         sdssetlen(s, len);
     }
-    usable = usable-hdrlen-1;
-    if (usable > sdsTypeMaxSize(type))
-        usable = sdsTypeMaxSize(type);
+    usable = bufsize - hdrlen - 1;
+    assert(type == SDS_TYPE_5 || usable <= sdsTypeMaxSize(type));
     sdssetalloc(s, usable);
     return s;
+}
+
+/* Enlarge the free space at the end of the sds string more than needed,
+ * This is useful to avoid repeated re-allocations when repeatedly appending to the sds. */
+sds sdsMakeRoomFor(sds s, size_t addlen) {
+    return _sdsMakeRoomFor(s, addlen, 1);
+}
+
+/* Unlike sdsMakeRoomFor(), this one just grows to the necessary size. */
+sds sdsMakeRoomForNonGreedy(sds s, size_t addlen) {
+    return _sdsMakeRoomFor(s, addlen, 0);
 }
 
 /* Reallocate the sds string so that it has no free space at the end. The
@@ -287,53 +353,90 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
  *
  * After the call, the passed sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call. */
-sds sdsRemoveFreeSpace(sds s) {
-    void *sh, *newsh;
-    char type, oldtype = s[-1] & SDS_TYPE_MASK;
+sds sdsRemoveFreeSpace(sds s, int would_regrow) {
+    return sdsResize(s, sdslen(s), would_regrow);
+}
+
+/* Resize the allocation, this can make the allocation bigger or smaller,
+ * if the size is smaller than currently used len, the data will be truncated.
+ *
+ * When the would_regrow argument is set to 1, it prevents the use of
+ * SDS_TYPE_5, which is desired when the sds is likely to be changed again.
+ *
+ * The sdsAlloc size will be set to the requested size regardless of the actual
+ * allocation size, this is done in order to avoid repeated calls to this
+ * function when the caller detects that it has excess space. */
+sds sdsResize(sds s, size_t size, int would_regrow) {
+    void *sh, *newsh = NULL;
+    char type, oldtype = sdsType(s);
     int hdrlen, oldhdrlen = sdsHdrSize(oldtype);
     size_t len = sdslen(s);
-    size_t avail = sdsavail(s);
     sh = (char*)s-oldhdrlen;
 
-    /* Return ASAP if there is no space left. */
-    if (avail == 0) return s;
+    /* Return ASAP if the size is already good. */
+    if (sdsalloc(s) == size) return s;
+
+    /* Truncate len if needed. */
+    if (size < len) len = size;
 
     /* Check what would be the minimum SDS header that is just good enough to
      * fit this string. */
-    type = sdsReqType(len);
+    type = sdsReqType(size);
+    if (would_regrow) {
+        /* Don't use type 5, it is not good for strings that are expected to grow back. */
+        if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+    }
     hdrlen = sdsHdrSize(type);
 
-    /* If the type is the same, or at least a large enough type is still
-     * required, we just realloc(), letting the allocator to do the copy
-     * only if really needed. Otherwise if the change is huge, we manually
-     * reallocate the string to use the different header type. */
-    if (oldtype==type || type > SDS_TYPE_8) {
-        newsh = s_realloc(sh, oldhdrlen+len+1);
-        if (newsh == NULL) return NULL;
-        s = (char*)newsh+oldhdrlen;
-    } else {
-        newsh = s_malloc(hdrlen+len+1);
-        if (newsh == NULL) return NULL;
-        memcpy((char*)newsh+hdrlen, s, len+1);
-        s_free(sh);
-        s = (char*)newsh+hdrlen;
-        s[-1] = type;
-        sdssetlen(s, len);
-    }
-    sdssetalloc(s, len);
-    return s;
-}
+    /* If the type is the same, or can hold the size in it with low overhead
+     * (larger than SDS_TYPE_8), we just realloc(), letting the allocator
+     * to do the copy only if really needed. Otherwise if the change is
+     * huge, we manually reallocate the string to use the different header
+     * type. */
+    int use_realloc = (oldtype==type || (type < oldtype && type > SDS_TYPE_8));
+    size_t newlen = use_realloc ? oldhdrlen+size+1 : hdrlen+size+1;
+    size_t bufsize = 0;
+    size_t newsize;
 
-/* Return the total size of the allocation of the specified sds string,
- * including:
- * 1) The sds header before the pointer.
- * 2) The string.
- * 3) The free buffer at the end if any.
- * 4) The implicit null term.
- */
-size_t sdsAllocSize(sds s) {
-    size_t alloc = sdsalloc(s);
-    return sdsHdrSize(s[-1])+alloc+1;
+    if (use_realloc) {
+        int alloc_already_optimal = 0;
+        #if defined(USE_JEMALLOC)
+            /* je_nallocx returns the expected allocation size for the newlen.
+             * We aim to avoid calling realloc() when using Jemalloc if there is no
+             * change in the allocation size, as it incurs a cost even if the
+             * allocation size stays the same. */
+        bufsize = sdsAllocSize(s);
+        alloc_already_optimal = (je_nallocx(newlen, 0) == bufsize);
+        #endif
+        if (!alloc_already_optimal) {
+            newsh = s_realloc_usable(sh, newlen, &bufsize, NULL);
+            if (newsh == NULL) return NULL;
+            s = (char *)newsh + oldhdrlen;
+
+            if (adjustTypeIfNeeded(&oldtype, &oldhdrlen, bufsize)) {
+                memmove((char *)newsh + oldhdrlen, s, len + 1);
+                s = (char *)newsh + oldhdrlen;
+                s[-1] = oldtype;
+                sdssetlen(s, len);
+            }
+        }
+        newsize = bufsize - oldhdrlen - 1;
+        debugAssert(oldtype == SDS_TYPE_5 || newsize <= sdsTypeMaxSize(oldtype));
+    } else {
+        newsh = s_malloc_usable(newlen, &bufsize);
+        if (newsh == NULL) return NULL;
+        adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+        memcpy((char *)newsh + hdrlen, s, len + 1);
+        s_free(sh);
+        s = (char *)newsh + hdrlen;
+        s[-1] = type;
+        newsize = bufsize - hdrlen - 1;
+        debugAssert(type == SDS_TYPE_5 || newsize <= sdsTypeMaxSize(type));
+    }
+    s[len] = 0;
+    sdssetlen(s, len);
+    sdssetalloc(s, newsize);
+    return s;
 }
 
 /* Return the pointer of the actual SDS allocation (normally SDS strings
@@ -366,12 +469,11 @@ void *sdsAllocPtr(sds s) {
  * sdsIncrLen(s, nread);
  */
 void sdsIncrLen(sds s, ssize_t incr) {
-    unsigned char flags = s[-1];
     size_t len;
-    switch(flags&SDS_TYPE_MASK) {
+    switch(sdsType(s)) {
         case SDS_TYPE_5: {
             unsigned char *fp = ((unsigned char*)s)-1;
-            unsigned char oldlen = SDS_TYPE_5_LEN(flags);
+            unsigned char oldlen = SDS_TYPE_5_LEN(s);
             assert((incr > 0 && oldlen+incr < 32) || (incr < 0 && oldlen >= (unsigned int)(-incr)));
             *fp = SDS_TYPE_5 | ((oldlen+incr) << SDS_TYPE_BITS);
             len = oldlen+incr;
@@ -469,77 +571,10 @@ sds sdscpylen(sds s, const char *t, size_t len) {
     return s;
 }
 
-/* Like sdscpylen() but 't' must be a null-termined string so that the length
+/* Like sdscpylen() but 't' must be a null-terminated string so that the length
  * of the string is obtained with strlen(). */
 sds sdscpy(sds s, const char *t) {
     return sdscpylen(s, t, strlen(t));
-}
-
-/* Helper for sdscatlonglong() doing the actual number -> string
- * conversion. 's' must point to a string with room for at least
- * SDS_LLSTR_SIZE bytes.
- *
- * The function returns the length of the null-terminated string
- * representation stored at 's'. */
-#define SDS_LLSTR_SIZE 21
-int sdsll2str(char *s, long long value) {
-    char *p, aux;
-    unsigned long long v;
-    size_t l;
-
-    /* Generate the string representation, this method produces
-     * a reversed string. */
-    v = (value < 0) ? -value : value;
-    p = s;
-    do {
-        *p++ = '0'+(v%10);
-        v /= 10;
-    } while(v);
-    if (value < 0) *p++ = '-';
-
-    /* Compute length and add null term. */
-    l = p-s;
-    *p = '\0';
-
-    /* Reverse the string. */
-    p--;
-    while(s < p) {
-        aux = *s;
-        *s = *p;
-        *p = aux;
-        s++;
-        p--;
-    }
-    return l;
-}
-
-/* Identical sdsll2str(), but for unsigned long long type. */
-int sdsull2str(char *s, unsigned long long v) {
-    char *p, aux;
-    size_t l;
-
-    /* Generate the string representation, this method produces
-     * a reversed string. */
-    p = s;
-    do {
-        *p++ = '0'+(v%10);
-        v /= 10;
-    } while(v);
-
-    /* Compute length and add null term. */
-    l = p-s;
-    *p = '\0';
-
-    /* Reverse the string. */
-    p--;
-    while(s < p) {
-        aux = *s;
-        *s = *p;
-        *p = aux;
-        s++;
-        p--;
-    }
-    return l;
 }
 
 /* Create an sds string from a long long value. It is much faster than:
@@ -547,8 +582,8 @@ int sdsull2str(char *s, unsigned long long v) {
  * sdscatprintf(sdsempty(),"%lld\n", value);
  */
 sds sdsfromlonglong(long long value) {
-    char buf[SDS_LLSTR_SIZE];
-    int len = sdsll2str(buf,value);
+    char buf[LONG_STR_SIZE];
+    int len = ll2string(buf,sizeof(buf),value);
 
     return sdsnewlen(buf,len);
 }
@@ -663,6 +698,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
         switch(*f) {
         case '%':
             next = *(f+1);
+            if (next == '\0') break;
             f++;
             switch(next) {
             case 's':
@@ -683,8 +719,8 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 else
                     num = va_arg(ap,long long);
                 {
-                    char buf[SDS_LLSTR_SIZE];
-                    l = sdsll2str(buf,num);
+                    char buf[LONG_STR_SIZE];
+                    l = ll2string(buf,sizeof(buf),num);
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
@@ -700,8 +736,8 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 else
                     unum = va_arg(ap,unsigned long long);
                 {
-                    char buf[SDS_LLSTR_SIZE];
-                    l = sdsull2str(buf,unum);
+                    char buf[LONG_STR_SIZE];
+                    l = ull2string(buf,sizeof(buf),unum);
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
@@ -731,7 +767,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
 }
 
 /* Remove the part of the string from left and from right composed just of
- * contiguous characters found in 'cset', that is a null terminted C string.
+ * contiguous characters found in 'cset', that is a null terminated C string.
  *
  * After the call, the modified sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call.
@@ -752,11 +788,26 @@ sds sdstrim(sds s, const char *cset) {
     ep = end = s+sdslen(s)-1;
     while(sp <= end && strchr(cset, *sp)) sp++;
     while(ep > sp && strchr(cset, *ep)) ep--;
-    len = (sp > ep) ? 0 : ((ep-sp)+1);
+    len = (ep-sp)+1;
     if (s != sp) memmove(s, sp, len);
     s[len] = '\0';
     sdssetlen(s,len);
     return s;
+}
+
+/* Changes the input string to be a subset of the original.
+ * It does not release the free space in the string, so a call to
+ * sdsRemoveFreeSpace may be wise after. */
+void sdssubstr(sds s, size_t start, size_t len) {
+    /* Clamp out of range input */
+    size_t oldlen = sdslen(s);
+    if (start >= oldlen) start = len = 0;
+    if (len > oldlen-start) len = oldlen-start;
+
+    /* Move the data */
+    if (len) memmove(s, s+start, len);
+    s[len] = 0;
+    sdssetlen(s,len);
 }
 
 /* Turn the string into a smaller (or equal) string containing only the
@@ -770,6 +821,11 @@ sds sdstrim(sds s, const char *cset) {
  *
  * The string is modified in-place.
  *
+ * NOTE: this function can be misleading and can have unexpected behaviour,
+ * specifically when you want the length of the new string to be 0.
+ * Having start==end will result in a string with one character.
+ * please consider using sdssubstr instead.
+ *
  * Example:
  *
  * s = sdsnew("Hello World");
@@ -777,28 +833,13 @@ sds sdstrim(sds s, const char *cset) {
  */
 void sdsrange(sds s, ssize_t start, ssize_t end) {
     size_t newlen, len = sdslen(s);
-
     if (len == 0) return;
-    if (start < 0) {
-        start = len+start;
-        if (start < 0) start = 0;
-    }
-    if (end < 0) {
-        end = len+end;
-        if (end < 0) end = 0;
-    }
+    if (start < 0)
+        start = len + start;
+    if (end < 0)
+        end = len + end;
     newlen = (start > end) ? 0 : (end-start)+1;
-    if (newlen != 0) {
-        if (start >= (ssize_t)len) {
-            newlen = 0;
-        } else if (end >= (ssize_t)len) {
-            end = len-1;
-            newlen = (start > end) ? 0 : (end-start)+1;
-        }
-    }
-    if (start && newlen) memmove(s, s+start, newlen);
-    s[newlen] = 0;
-    sdssetlen(s,newlen);
+    sdssubstr(s, start, newlen);
 }
 
 /* Apply tolower() to every character of the sds string 's'. */
@@ -838,6 +879,16 @@ int sdscmp(const sds s1, const sds s2) {
     return cmp;
 }
 
+/* Compare two sds strings by length first, then content.
+ * Faster than sdscmp when strings often have different lengths.
+ * Returns: negative if s1 < s2, positive if s1 > s2, 0 if equal. */
+int sdscmplen(const sds s1, const sds s2) {
+    size_t l1 = sdslen(s1);
+    size_t l2 = sdslen(s2);
+    if (l1 != l2) return (l1 > l2) ? 1 : -1;
+    return memcmp(s1, s2, l1);
+}
+
 /* Split 's' with separator in 'sep'. An array
  * of sds strings is returned. *count will be set
  * by reference to the number of tokens returned.
@@ -859,15 +910,13 @@ sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *c
     long start = 0, j;
     sds *tokens;
 
-    if (seplen < 1 || len < 0) return NULL;
-
+    if (seplen < 1 || len <= 0) {
+        *count = 0;
+        return NULL;
+    }
     tokens = s_malloc(sizeof(sds)*slots);
     if (tokens == NULL) return NULL;
 
-    if (len == 0) {
-        *count = 0;
-        return tokens;
-    }
     for (j = 0; j < (len-(seplen-1)); j++) {
         /* make sure there is room for the next element and the final one */
         if (slots < elements+2) {
@@ -919,6 +968,7 @@ void sdsfreesplitres(sds *tokens, int count) {
  * After the call, the modified sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call. */
 sds sdscatrepr(sds s, const char *p, size_t len) {
+    s = sdsMakeRoomFor(s, len + 2);
     s = sdscatlen(s,"\"",1);
     while(len--) {
         switch(*p) {
@@ -933,7 +983,7 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         case '\b': s = sdscatlen(s,"\\b",2); break;
         default:
             if (isprint(*p))
-                s = sdscatprintf(s,"%c",*p);
+                s = sdscatlen(s, p, 1);
             else
                 s = sdscatprintf(s,"\\x%02x",(unsigned char)*p);
             break;
@@ -941,6 +991,26 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         p++;
     }
     return sdscatlen(s,"\"",1);
+}
+
+/* Returns one if the string contains characters to be escaped
+ * by sdscatrepr(), zero otherwise.
+ *
+ * Typically, this should be used to help protect aggregated strings in a way
+ * that is compatible with sdssplitargs(). For this reason, also spaces will be
+ * treated as needing an escape.
+ */
+int sdsneedsrepr(const sds s) {
+    size_t len = sdslen(s);
+    const char *p = s;
+
+    while (len--) {
+        if (*p == '\\' || *p == '"' || *p == '\n' || *p == '\r' ||
+            *p == '\t' || *p == '\a' || *p == '\b' || !isprint(*p) || isspace(*p)) return 1;
+        p++;
+    }
+
+    return 0;
 }
 
 /* Helper function for sdssplitargs() that returns non zero if 'c'
@@ -1179,7 +1249,7 @@ sds sdstemplate(const char *template, sdstemplate_callback_t cb_func, void *cb_a
             res = sdscat(res, p);
             break;
         } else if (sv > p) {
-            /* Found: copy anything up to the begining of the variable */
+            /* Found: copy anything up to the beginning of the variable */
             res = sdscatlen(res, p, sv - p);
         }
 
@@ -1234,10 +1304,10 @@ static sds sdsTestTemplateCallback(sds varname, void *arg) {
     else return NULL;
 }
 
-int sdsTest(int argc, char **argv, int accurate) {
+int sdsTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
-    UNUSED(accurate);
+    UNUSED(flags);
 
     {
         sds x = sdsnew("foo"), y;
@@ -1354,6 +1424,18 @@ int sdsTest(int argc, char **argv, int accurate) {
             sdslen(y) == 0 && memcmp(y,"\0",1) == 0);
 
         sdsfree(y);
+        y = sdsdup(x);
+        sdsrange(y,4,6);
+        test_cond("sdsrange(...,4,6)",
+            sdslen(y) == 0 && memcmp(y,"\0",1) == 0);
+
+        sdsfree(y);
+        y = sdsdup(x);
+        sdsrange(y,3,6);
+        test_cond("sdsrange(...,3,6)",
+            sdslen(y) == 1 && memcmp(y,"o\0",2) == 0);
+
+        sdsfree(y);
         sdsfree(x);
         x = sdsnew("foo");
         y = sdsnew("foa");
@@ -1394,7 +1476,7 @@ int sdsTest(int argc, char **argv, int accurate) {
             for (i = 0; i < 10; i++) {
                 size_t oldlen = sdslen(x);
                 x = sdsMakeRoomFor(x,step);
-                int type = x[-1]&SDS_TYPE_MASK;
+                int type = sdsType(x);
 
                 test_cond("sdsMakeRoomFor() len", sdslen(x) == oldlen);
                 if (type != SDS_TYPE_5) {
@@ -1438,8 +1520,80 @@ int sdsTest(int argc, char **argv, int accurate) {
         test_cond("sdstemplate() with quoting",
                   memcmp(x,"v1={value1} {} v2=value2",24) == 0);
         sdsfree(x);
+
+        /* Test sdsresize - extend */
+        x = sdsnew("1234567890123456789012345678901234567890");
+        x = sdsResize(x, 200, 1);
+        test_cond("sdsresize() expand len", sdslen(x) == 40);
+        test_cond("sdsresize() expand strlen", strlen(x) == 40);
+#if defined(USE_JEMALLOC)
+        /* 224 - hdrlen(3) - 1(\0) */
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 220);
+#endif
+        /* Test sdsresize - trim free space */
+        x = sdsResize(x, 80, 1);
+        test_cond("sdsresize() shrink len", sdslen(x) == 40);
+        test_cond("sdsresize() shrink strlen", strlen(x) == 40);
+#if defined(USE_JEMALLOC)
+        /* 96 - hdrlen(3) - 1(\0) */
+        test_cond("sdsresize() shrink alloc", sdsalloc(x) == 92);
+#endif
+        /* Test sdsresize - crop used space */
+        x = sdsResize(x, 30, 1);
+        test_cond("sdsresize() crop len", sdslen(x) == 30);
+        test_cond("sdsresize() crop strlen", strlen(x) == 30);
+#if defined(USE_JEMALLOC)
+        /* 40 - hdrlen(3) - 1(\0) */
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 36);
+#endif
+        /* Test sdsresize - extend to different class */
+        x = sdsResize(x, 400, 1);
+        test_cond("sdsresize() expand len", sdslen(x) == 30);
+        test_cond("sdsresize() expand strlen", strlen(x) == 30);
+#if defined(USE_JEMALLOC)
+        /* 448 - hdrlen(5) - 1(\0) */
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 442);
+#endif
+        /* Test sdsresize - shrink to different class */
+        x = sdsResize(x, 4, 1);
+        test_cond("sdsresize() crop len", sdslen(x) == 4);
+        test_cond("sdsresize() crop strlen", strlen(x) == 4);
+#if defined(USE_JEMALLOC)
+        /* 8 - hdrlen(3) - 1(\0) */
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 4);
+#endif
+        sdsfree(x);
+        
+        { /* Test adjustTypeIfNeeded() */
+            /* Test case: Type should be adjusted when buffer size exceeds max size for current type */
+            char type = SDS_TYPE_8;
+            int hdrlen = sdsHdrSize(type);
+            size_t bufsize = (1<<8) + hdrlen + 1; /* Exceeds SDS_TYPE_8 max size */
+
+            int result = adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+            test_cond("adjustTypeIfNeeded() returns 1 when type needs adjustment", result == 1);
+            test_cond("adjustTypeIfNeeded() adjusts type correctly", type == SDS_TYPE_16);
+            test_cond("adjustTypeIfNeeded() adjusts header length correctly", hdrlen == sdsHdrSize(SDS_TYPE_16));
+
+            /* Test case: Type should not be adjusted when buffer size is within max size for current type */
+            type = SDS_TYPE_8;
+            hdrlen = sdsHdrSize(type);
+            bufsize = (1<<8) - 10 + hdrlen + 1; /* Within SDS_TYPE_8 max size */
+            result = adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+            test_cond("adjustTypeIfNeeded() returns 0 when type doesn't need adjustment", result == 0);
+            test_cond("adjustTypeIfNeeded() doesn't change type when not needed", type == SDS_TYPE_8);
+            test_cond("adjustTypeIfNeeded() doesn't change header length when not needed", hdrlen == sdsHdrSize(SDS_TYPE_8));
+
+            /* Test case 3: Type 5 should never be adjusted */
+            type = SDS_TYPE_5;
+            hdrlen = sdsHdrSize(type);
+            bufsize = 1000; /* Large buffer size */
+            result = adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+            test_cond("adjustTypeIfNeeded() returns 0 for SDS_TYPE_5", result == 0);
+            test_cond("adjustTypeIfNeeded() doesn't change SDS_TYPE_5", type == SDS_TYPE_5);
+            test_cond("adjustTypeIfNeeded() doesn't change header length for SDS_TYPE_5", hdrlen == sdsHdrSize(SDS_TYPE_5));
+        }
     }
-    test_report();
     return 0;
 }
 #endif

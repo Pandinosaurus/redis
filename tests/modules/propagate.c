@@ -9,37 +9,32 @@
  *
  * -----------------------------------------------------------------------------
  *
- * Copyright (c) 2019, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2019-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
-#define REDISMODULE_EXPERIMENTAL_API
 #include "redismodule.h"
 #include <pthread.h>
+#include <errno.h>
+
+#define UNUSED(V) ((void) V)
+
+RedisModuleCtx *detached_ctx = NULL;
+
+static int KeySpace_NotificationGeneric(RedisModuleCtx *ctx, int type, const char *event, RedisModuleString *key) {
+    REDISMODULE_NOT_USED(type);
+    REDISMODULE_NOT_USED(event);
+    REDISMODULE_NOT_USED(key);
+
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, "INCR", "c!", "notifications");
+    RedisModule_FreeCallReply(rep);
+
+    return REDISMODULE_OK;
+}
 
 /* Timer callback. */
 void timerHandler(RedisModuleCtx *ctx, void *data) {
@@ -75,9 +70,11 @@ void timerNestedHandler(RedisModuleCtx *ctx, void *data) {
     int repl = (long long)data;
 
     /* The goal is the trigger a module command that calls RM_Replicate
-     * in order to test MULTI/EXEC structre */
+     * in order to test MULTI/EXEC structure */
     RedisModule_Replicate(ctx,"INCRBY","cc","timer-nested-start","1");
     RedisModuleCallReply *reply = RedisModule_Call(ctx,"propagate-test.nested", repl? "!" : "");
+    RedisModule_FreeCallReply(reply);
+    reply = RedisModule_Call(ctx, "INCR", repl? "c!" : "c", "timer-nested-middle");
     RedisModule_FreeCallReply(reply);
     RedisModule_Replicate(ctx,"INCRBY","cc","timer-nested-end","1");
 }
@@ -108,6 +105,62 @@ int propagateTestTimerNestedReplCommand(RedisModuleCtx *ctx, RedisModuleString *
     return REDISMODULE_OK;
 }
 
+void timerHandlerMaxmemory(RedisModuleCtx *ctx, void *data) {
+    REDISMODULE_NOT_USED(ctx);
+    REDISMODULE_NOT_USED(data);
+
+    RedisModuleCallReply *reply = RedisModule_Call(ctx,"SETEX","ccc!","timer-maxmemory-volatile-start","100","1");
+    RedisModule_FreeCallReply(reply);
+    reply = RedisModule_Call(ctx, "CONFIG", "ccc!", "SET", "maxmemory", "1");
+    RedisModule_FreeCallReply(reply);
+
+    RedisModule_Replicate(ctx, "INCR", "c", "timer-maxmemory-middle");
+
+    reply = RedisModule_Call(ctx,"SETEX","ccc!","timer-maxmemory-volatile-end","100","1");
+    RedisModule_FreeCallReply(reply);
+}
+
+int propagateTestTimerMaxmemoryCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
+{
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    RedisModuleTimerID timer_id =
+        RedisModule_CreateTimer(ctx,100,timerHandlerMaxmemory,(void*)1);
+    REDISMODULE_NOT_USED(timer_id);
+
+    RedisModule_ReplyWithSimpleString(ctx,"OK");
+    return REDISMODULE_OK;
+}
+
+void timerHandlerEval(RedisModuleCtx *ctx, void *data) {
+    REDISMODULE_NOT_USED(ctx);
+    REDISMODULE_NOT_USED(data);
+
+    RedisModuleCallReply *reply = RedisModule_Call(ctx,"INCRBY","cc!","timer-eval-start","1");
+    RedisModule_FreeCallReply(reply);
+    reply = RedisModule_Call(ctx, "EVAL", "cccc!", "redis.call('set',KEYS[1],ARGV[1])", "1", "foo", "bar");
+    RedisModule_FreeCallReply(reply);
+
+    RedisModule_Replicate(ctx, "INCR", "c", "timer-eval-middle");
+
+    reply = RedisModule_Call(ctx,"INCRBY","cc!","timer-eval-end","1");
+    RedisModule_FreeCallReply(reply);
+}
+
+int propagateTestTimerEvalCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
+{
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    RedisModuleTimerID timer_id =
+        RedisModule_CreateTimer(ctx,100,timerHandlerEval,(void*)1);
+    REDISMODULE_NOT_USED(timer_id);
+
+    RedisModule_ReplyWithSimpleString(ctx,"OK");
+    return REDISMODULE_OK;
+}
+
 /* The thread entry point. */
 void *threadMain(void *arg) {
     REDISMODULE_NOT_USED(arg);
@@ -116,6 +169,8 @@ void *threadMain(void *arg) {
     for (int i = 0; i < 3; i++) {
         RedisModule_ThreadSafeContextLock(ctx);
         RedisModule_Replicate(ctx,"INCR","c","a-from-thread");
+        RedisModuleCallReply *reply = RedisModule_Call(ctx,"INCR","c!","thread-call");
+        RedisModule_FreeCallReply(reply);
         RedisModule_Replicate(ctx,"INCR","c","b-from-thread");
         RedisModule_ThreadSafeContextUnlock(ctx);
     }
@@ -131,7 +186,38 @@ int propagateTestThreadCommand(RedisModuleCtx *ctx, RedisModuleString **argv, in
     pthread_t tid;
     if (pthread_create(&tid,NULL,threadMain,NULL) != 0)
         return RedisModule_ReplyWithError(ctx,"-ERR Can't start thread");
-    REDISMODULE_NOT_USED(tid);
+    pthread_detach(tid);
+
+    RedisModule_ReplyWithSimpleString(ctx,"OK");
+    return REDISMODULE_OK;
+}
+
+/* The thread entry point. */
+void *threadDetachedMain(void *arg) {
+    REDISMODULE_NOT_USED(arg);
+    RedisModule_SelectDb(detached_ctx,9); /* Tests ran in database number 9. */
+
+    RedisModule_ThreadSafeContextLock(detached_ctx);
+    RedisModule_Replicate(detached_ctx,"INCR","c","thread-detached-before");
+    RedisModuleCallReply *reply = RedisModule_Call(detached_ctx,"INCR","c!","thread-detached-1");
+    RedisModule_FreeCallReply(reply);
+    reply = RedisModule_Call(detached_ctx,"INCR","c!","thread-detached-2");
+    RedisModule_FreeCallReply(reply);
+    RedisModule_Replicate(detached_ctx,"INCR","c","thread-detached-after");
+    RedisModule_ThreadSafeContextUnlock(detached_ctx);
+
+    return NULL;
+}
+
+int propagateTestDetachedThreadCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
+{
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    pthread_t tid;
+    if (pthread_create(&tid,NULL,threadDetachedMain,NULL) != 0)
+        return RedisModule_ReplyWithError(ctx,"-ERR Can't start thread");
+    pthread_detach(tid);
 
     RedisModule_ReplyWithSimpleString(ctx,"OK");
     return REDISMODULE_OK;
@@ -188,6 +274,18 @@ int propagateTestNestedCommand(RedisModuleCtx *ctx, RedisModuleString **argv, in
     reply = RedisModule_Call(ctx, "INCR", "c!", "after-call");
     RedisModule_FreeCallReply(reply);
 
+    reply = RedisModule_Call(ctx, "INCR", "c!", "before-call-2");
+    RedisModule_FreeCallReply(reply);
+
+    reply = RedisModule_Call(ctx, "keyspace.incr_case1", "c!", "asdf"); /* Propagates INCR */
+    RedisModule_FreeCallReply(reply);
+
+    reply = RedisModule_Call(ctx, "keyspace.del_key_copy", "c!", "asdf"); /* Propagates DEL */
+    RedisModule_FreeCallReply(reply);
+
+    reply = RedisModule_Call(ctx, "INCR", "c!", "after-call-2");
+    RedisModule_FreeCallReply(reply);
+
     RedisModule_ReplyWithSimpleString(ctx,"OK");
     return REDISMODULE_OK;
 }
@@ -205,12 +303,32 @@ int propagateTestIncr(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     return REDISMODULE_OK;
 }
 
+int propagateTestVerbatim(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc < 2){
+        RedisModule_WrongArity(ctx);
+        return REDISMODULE_OK;
+    }
+
+    long long replicate_num;
+    RedisModule_StringToLongLong(argv[1], &replicate_num);
+    /* Replicate the command verbatim for the specified number of times. */
+    for (long long i = 0; i < replicate_num; i++)
+        RedisModule_ReplicateVerbatim(ctx);
+    RedisModule_ReplyWithSimpleString(ctx,"OK");
+    return REDISMODULE_OK;
+}
+
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
     REDISMODULE_NOT_USED(argc);
 
     if (RedisModule_Init(ctx,"propagate-test",1,REDISMODULE_APIVER_1)
             == REDISMODULE_ERR) return REDISMODULE_ERR;
+
+    detached_ctx = RedisModule_GetDetachedThreadSafeContext(ctx);
+
+    if (RedisModule_SubscribeToKeyspaceEvents(ctx, REDISMODULE_NOTIFY_ALL, KeySpace_NotificationGeneric) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"propagate-test.timer",
                 propagateTestTimerCommand,
@@ -227,8 +345,23 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
                 "",1,1,1) == REDISMODULE_ERR)
             return REDISMODULE_ERR;
 
+    if (RedisModule_CreateCommand(ctx,"propagate-test.timer-maxmemory",
+                propagateTestTimerMaxmemoryCommand,
+                "",1,1,1) == REDISMODULE_ERR)
+            return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"propagate-test.timer-eval",
+                propagateTestTimerEvalCommand,
+                "",1,1,1) == REDISMODULE_ERR)
+            return REDISMODULE_ERR;
+
     if (RedisModule_CreateCommand(ctx,"propagate-test.thread",
                 propagateTestThreadCommand,
+                "",1,1,1) == REDISMODULE_ERR)
+            return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"propagate-test.detached-thread",
+                propagateTestDetachedThreadCommand,
                 "",1,1,1) == REDISMODULE_ERR)
             return REDISMODULE_ERR;
 
@@ -239,18 +372,32 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx,"propagate-test.mixed",
                 propagateTestMixedCommand,
-                "",1,1,1) == REDISMODULE_ERR)
+                "write",1,1,1) == REDISMODULE_ERR)
             return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"propagate-test.nested",
                 propagateTestNestedCommand,
-                "",1,1,1) == REDISMODULE_ERR)
+                "write",1,1,1) == REDISMODULE_ERR)
             return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"propagate-test.incr",
                 propagateTestIncr,
-                "",1,1,1) == REDISMODULE_ERR)
+                "write",1,1,1) == REDISMODULE_ERR)
             return REDISMODULE_ERR;
+        
+    if (RedisModule_CreateCommand(ctx,"propagate-test.verbatim",
+            propagateTestVerbatim,
+            "write",1,1,1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    return REDISMODULE_OK;
+}
+
+int RedisModule_OnUnload(RedisModuleCtx *ctx) {
+    UNUSED(ctx);
+
+    if (detached_ctx)
+        RedisModule_FreeThreadSafeContext(detached_ctx);
 
     return REDISMODULE_OK;
 }

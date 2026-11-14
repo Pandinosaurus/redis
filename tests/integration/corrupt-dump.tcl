@@ -1,14 +1,188 @@
 # tests of corrupt ziplist payload with valid CRC
 # * setting crash-memcheck-enabled to no to avoid issues with valgrind
 # * setting use-exit-on-panic to yes so that valgrind can search for leaks
-# * settng debug set-skip-checksum-validation to 1 on some tests for which we
+# * setting debug set-skip-checksum-validation to 1 on some tests for which we
 #   didn't bother to fake a valid checksum
 # * some tests set sanitize-dump-payload to no and some to yet, depending on
 #   what we want to test
 
-tags {"dump" "corruption"} {
+tags {"dump" "corruption" "external:skip"} {
+
+# We only run OOM related tests on x86_64 and aarch64, as jemalloc on other
+# platforms (notably s390x) may actually succeed very large allocations. As
+# a result the test may hang for a very long time at the cleanup phase,
+# iterating as many as 2^61 hash table slots.
+
+set arch_name [exec uname -m]
+set run_oom_tests [expr {($arch_name == "x86_64" || $arch_name == "aarch64") && !$::tsan}]
 
 set corrupt_payload_7445 "\x0E\x01\x1D\x1D\x00\x00\x00\x16\x00\x00\x00\x03\x00\x00\x04\x43\x43\x43\x43\x06\x04\x42\x42\x42\x42\x06\x3F\x41\x41\x41\x41\xFF\x09\x00\x88\xA5\xCA\xA8\xC5\x41\xF4\x35"
+
+test {corrupt payload: zset reservation rejects oversized counts} {
+    start_server {overrides {loglevel verbose}} {
+        r debug set-skip-checksum-validation 1
+        r set target preserved
+        # Both legacy ZSET and ZSET_2 use the same 64-bit count. These values
+        # exercise sizing overflow and allocator rejection without attempting
+        # a large allocation. The footer has RDB version 9 and a dummy CRC.
+        foreach type {03 05} {
+            foreach count {fffffffffffffffe 1fffffffffffffff 1000000000000000} {
+                set payload [binary format H* "${type}81${count}09000000000000000000"]
+                assert_error {*Bad data format*} {r restore target 0 $payload replace}
+                assert_equal preserved [r get target]
+                assert_equal PONG [r ping]
+            }
+        }
+        verify_log_message 0 "*Unable to reserve zset index*" 0
+    }
+}
+
+test {Zset listpack scores are validated before loading or conversion} {
+    start_server {} {
+        r zadd score-source 1.5 a 2.5 b
+        assert_encoding listpack score-source
+        set payload [r dump score-source]
+        # Mutate only the score text; bypass the now-stale DUMP checksum so
+        # the test exercises semantic validation of a well-formed listpack.
+        r debug set-skip-checksum-validation 1
+        # Without sanitization a listpack that stays one is trusted, as for
+        # other types. A conversion still checks every score first.
+        foreach {sanitize limit} {yes 128 yes 1 no 1} {
+            r config set sanitize-dump-payload $sanitize
+            r config set zset-max-listpack-entries $limit
+            foreach score {nan NaN abc 1.x} {
+                set invalid [string map [list 1.5 $score] $payload]
+                assert_error {*Bad data format*} {r restore invalid-score 0 $invalid}
+                assert_equal 0 [r exists invalid-score]
+                assert_equal PONG [r ping]
+            }
+            # Both infinities are legal and must remain reloadable.
+            foreach score {inf -inf} {
+                # -inf needs four bytes, so use ZADD's genuine payload.
+                r del score-valid
+                r zadd score-valid $score a 2.5 b
+                set valid [r dump score-valid]
+                r restore score-roundtrip 0 $valid replace
+                assert_equal $score [r zscore score-roundtrip a]
+            }
+        }
+        r debug set-skip-checksum-validation 0
+        r config set sanitize-dump-payload yes
+        r config set zset-max-listpack-entries 128
+        r debug reload
+        assert_equal PONG [r ping]
+        assert_equal 0 [r exists invalid-score]
+    }
+}
+
+test {ZRANGESTORE builds an ordered btree from an unordered listpack} {
+    start_server {} {
+        # Mix string and integer members to cover both emit callbacks.
+        r zadd order-source 1.5 a 2.5 2 3.5 c 4.5 4
+        assert_encoding listpack order-source
+        # Deep sanitization checks scores and duplicates, not their order,
+        # so a listpack holding 1.5 4.5 3.5 2.5 is accepted.
+        set payload [string map {2.5 4.5 4.5 2.5} [r dump order-source]]
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload yes
+        r restore unordered 0 $payload
+        assert_encoding listpack unordered
+        r config set zset-max-listpack-entries 1
+        foreach range {{0 -1} {-inf +inf byscore} {- + bylex}} {
+            r del dst
+            assert_equal 4 [r zrangestore dst unordered {*}$range]
+            assert_encoding btree dst
+            assert_equal {a 1.5 4 2.5 c 3.5 2 4.5} [r zrange dst 0 -1 withscores]
+            assert_equal 3 [r zcount dst 0 4]
+            assert_equal {a 4 c} [r zrangebyscore dst 0 4]
+        }
+        r debug set-skip-checksum-validation 0
+        r config set zset-max-listpack-entries 128
+    }
+}
+
+test {ZMOVE builds an ordered btree from an unordered listpack} {
+    start_server {} {
+        r zadd order-source 1.5 a 2.5 2 3.5 c 4.5 4
+        assert_encoding listpack order-source
+        # As above, a listpack holding 1.5 4.5 3.5 2.5 is accepted.
+        set payload [string map {2.5 4.5 4.5 2.5} [r dump order-source]]
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload yes
+        foreach selection {{MIN COUNT 4} {BYSCORE -inf +inf}} {
+            r del dst
+            r config set zset-max-listpack-entries 128
+            r restore unordered 0 $payload
+            assert_encoding listpack unordered
+            r config set zset-max-listpack-entries 1
+            # Members are moved in listpack order, yet must be placed by score.
+            assert_equal {{a 1.5} {2 4.5} {c 3.5} {4 2.5}} [r zmove unordered dst {*}$selection]
+            assert_equal 0 [r exists unordered]
+            assert_encoding btree dst
+            assert_equal {a 1.5 4 2.5 c 3.5 2 4.5} [r zrange dst 0 -1 withscores]
+            assert_equal 3 [r zcount dst 0 4]
+            assert_equal {a 4 c} [r zrangebyscore dst 0 4]
+        }
+        r debug set-skip-checksum-validation 0
+        r config set zset-max-listpack-entries 128
+    }
+}
+
+test {ZRANGESTORE asserts on a listpack that repeats a member} {
+    foreach {members old new} [list \
+        {a b c d}  "\x81\x63"      "\x81\x61" \
+        {1 2 3 4}  "\x03\x01\x03"  "\x01\x01\x03" \
+    ] {
+        lassign $members m1 m2 m3 m4
+        start_server [list overrides [list use-exit-on-panic yes crash-memcheck-enabled no] ] {
+            r debug set-skip-checksum-validation 1
+            r config set sanitize-dump-payload no
+
+            # Restore a listpack whose third member repeats the first.
+            r zadd dup-source 1 $m1 2 $m2 3 $m3 4 $m4
+            assert_encoding listpack dup-source
+            set payload [string map [list $old $new] [r dump dup-source]]
+            r restore dup 0 $payload
+            assert_equal "$m1 1 $m2 2 $m1 3 $m4 4" [r zrange dup 0 -1 withscores]
+
+            # zsetAdd() would silently merge the repeat and the reply would
+            # count 4 while dst holds 3, so ZRANGESTORE must assert instead.
+            catch {r zrangestore dst dup 0 -1}
+            wait_for_log_messages 0 {"*ASSERTION FAILED*"} 0 100 50
+            assert_equal 0 [count_log_message 0 "crashed by signal"]
+        }
+    }
+}
+
+test {Zset listpack duplicate members are rejected by sanitization and assert on conversion} {
+    start_server [list overrides [list use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r zadd dup-source 1 alpha 2 bravo
+        assert_encoding listpack dup-source
+        # Both pairs stay ordered by (score, member), so only a uniqueness
+        # check can catch the duplicate.
+        set payload [string map {bravo alpha} [r dump dup-source]]
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload yes
+        foreach {limit} {128 1} {
+            r config set zset-max-listpack-entries $limit
+            assert_error {*Bad data format*} {r restore dup 0 $payload}
+            assert_equal 0 [r exists dup]
+            assert_equal PONG [r ping]
+        }
+
+        # Without sanitization loading does not look for duplicates, whether
+        # the listpack stays one or is converted. A conversion must still not
+        # publish both copies, so it asserts, as the skiplist one did.
+        r config set sanitize-dump-payload no
+        r config set zset-max-listpack-entries 128
+        r restore dup 0 $payload
+        assert_encoding listpack dup
+        r config set zset-max-listpack-entries 2
+        catch {r zadd dup 3 charlie}
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
 
 test {corrupt payload: #7445 - with sanitize} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
@@ -21,64 +195,98 @@ test {corrupt payload: #7445 - with sanitize} {
     }
 }
 
-test {corrupt payload: #7445 - without sanitize - 1} {
-    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
-        r restore key 0 $corrupt_payload_7445
-        catch {r lindex key 2}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
-    }
-}
-
-test {corrupt payload: #7445 - without sanitize - 2} {
-    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
-        r restore key 0 $corrupt_payload_7445
-        catch {r lset key 2 "BEEF"}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
-    }
-}
-
 test {corrupt payload: hash with valid zip list header, invalid entry len} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
-        r restore key 0 "\x0D\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02\x61\x00\x04\x02\x62\x00\x04\x14\x63\x00\x04\x02\x64\x00\xFF\x09\x00\xD9\x10\x54\x92\x15\xF5\x5F\x52"
-        r config set hash-max-ziplist-entries 1
-        catch {r hset key b b}
-        verify_log_message 0 "*zipEntrySafe*" 0
+        catch {
+            r restore key 0 "\x0D\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02\x61\x00\x04\x02\x62\x00\x04\x14\x63\x00\x04\x02\x64\x00\xFF\x09\x00\xD9\x10\x54\x92\x15\xF5\x5F\x52"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
 test {corrupt payload: invalid zlbytes header} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
         catch {
             r restore key 0 "\x0D\x1B\x25\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02\x61\x00\x04\x02\x62\x00\x04\x02\x63\x00\x04\x02\x64\x00\xFF\x09\x00\xB7\xF7\x6E\x9F\x43\x43\x14\xC6"
         } err
         assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
 test {corrupt payload: valid zipped hash header, dup records} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
-        r restore key 0 "\x0D\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02\x61\x00\x04\x02\x62\x00\x04\x02\x61\x00\x04\x02\x64\x00\xFF\x09\x00\xA1\x98\x36\x78\xCC\x8E\x93\x2E"
-        r config set hash-max-ziplist-entries 1
-        # cause an assertion when converting to hash table
-        catch {r hset key b b}
-        verify_log_message 0 "*ziplist with dup elements dump*" 0
+        catch {
+            r restore key 0 "\x0D\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02\x61\x00\x04\x02\x62\x00\x04\x02\x61\x00\x04\x02\x64\x00\xFF\x09\x00\xA1\x98\x36\x78\xCC\x8E\x93\x2E"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: hash listpackex with invalid string TTL} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        catch {
+            r restore key 0 "\x17\x2d\x2d\x00\x00\x00\x09\x00\x81\x61\x02\x01\x01\xf4\xa6\x96\x18\xb8\x8f\x01\x00\x00\x09\x82\x66\x31\x03\x82\x76\x31\x03\x83\x66\x6f\x6f\x04\x82\x66\x32\x03\x82\x76\x32\x03\x00\x01\xff\x0c\x00\xde\x40\xe5\x37\x51\x1c\x12\x56" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: hash listpackex with TTL large than EB_EXPIRE_TIME_MAX} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        catch {
+            r restore key 0 "\x17\x33\x33\x00\x00\x00\x09\x00\x00\x01\x00\x01\xf4\x01\xc5\x89\x95\x8f\x01\x00\x00\x09\x01\x01\x82\x5f\x31\x03\xf4\x29\x94\x97\x95\x8f\x01\x00\x00\x09\x02\x01\x02\x01\xf4\x01\x5e\xaf\x95\x8f\x01\x33\x00\x09\xff\x0c\x00\x7e\x4f\xf4\x33\xe9\xc5\x3e\x56" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: hash listpackex with unordered TTL fields} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        catch {
+            r restore key 0 "\x17\xc3\x30\x35\x14\x35\x00\x00\x00\t\x00\x82\x66\x32\x03\x82\x76\x32\x03\xf4\x80\x73\x16\xd1\x8f\x01\x20\x12\x02\x82\x66\x31\x20\x11\x03\x31\x03\xf4\x7f\xe0\x01\x11\x00\x33\x20\x11\x04\x33\x03\x00\x01\xff\x0c\x00\xf6\x70\x29\x57\x11\x68\x9d\xe5" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: hash listpackex field without TTL should not be followed by field with TTL} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        catch {
+            r restore key 0 "\x17\x2d\x2d\x00\x00\x00\x09\x00\x82\x66\x31\x03\x82\x76\x31\x03\x00\x01\x82\x66\x32\x03\x82\x76\x32\x03\xf4\xe0\x59\x7a\x96\x00\x00\x00\x00\x09\x82\x66\x33\x03\x82\x76\x33\x03\x00\x01\xff\x0c\x00\x42\x66\xd4\xbe\x17\xc3\x96\x72" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: hash hashtable with TTL large than EB_EXPIRE_TIME_MAX} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set hash-max-listpack-entries 0
+        r config set sanitize-dump-payload yes
+        catch {
+            r restore key 0 "\x16\x02\x81\x00\x01\x00\x00\x00\x00\x00\x00\x02\x66\x31\x02\x76\x31\x81\x00\x01\x00\x00\x00\x00\x00\x00\x02\x66\x32\x02\x76\x32\x0c\x00\xb9\x3c\x65\x28\x40\x94\x58\x36" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
     }
 }
 
 test {corrupt payload: quicklist big ziplist prev len} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
-        r restore key 0 "\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x02\x00\x00\x02\x61\x00\x0E\x02\x62\x00\xFF\x09\x00\x49\x97\x30\xB2\x0D\xA1\xED\xAA"
-        catch {r lindex key -2}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r restore key 0 "\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x02\x00\x00\x02\x61\x00\x0E\x02\x62\x00\xFF\x09\x00\x49\x97\x30\xB2\x0D\xA1\xED\xAA"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -96,13 +304,9 @@ test {corrupt payload: quicklist small ziplist prev len} {
 test {corrupt payload: quicklist ziplist wrong count} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
-        r restore key 0 "\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x03\x00\x00\x02\x61\x00\x04\x02\x62\x00\xFF\x09\x00\x4D\xE2\x0A\x2F\x08\x25\xDF\x91"
-        # we'll be able to push, but iterating on the list will assert
-        r lpush key header
-        r rpush key footer
-        catch { [r lrange key -1 -1] }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r restore key 0 "\x0E\x01\x13\x13\x00\x00\x00\x0E\x00\x00\x00\x03\x00\x00\x02\x61\x00\x04\x02\x62\x00\xFF\x09\x00\x4D\xE2\x0A\x2F\x08\x25\xDF\x91"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -115,6 +319,33 @@ test {corrupt payload: #3080 - quicklist} {
         } err
         assert_match "*Bad data format*" $err
         verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: quicklist with empty ziplist} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\x0E\x01\x0B\x0B\x00\x00\x00\x0A\x00\x00\x00\x00\x00\xFF\x09\x00\xC2\x69\x37\x83\x3C\x7F\xFE\x6F" replace} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: quicklist encoded_len is 0} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        catch { r restore _list 0 "\x12\x01\x01\x00\x0a\x00\x8f\xc6\xc0\x57\x1c\x0a\xb3\x3c" replace } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: quicklist listpack entry start with EOF} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        catch { r restore _list 0 "\x12\x01\x02\x0b\x0b\x00\x00\x00\x01\x00\x81\x61\x02\xff\xff\x0a\x00\x7e\xd8\xde\x5b\x0d\xd7\x70\xb8" replace } err
+        assert_match "*Bad data format*" $err
+        r ping
     }
 }
 
@@ -137,7 +368,7 @@ test {corrupt payload: load corrupted rdb with no CRC - #3505} {
 
     # wait for termination
     wait_for_condition 100 50 {
-        ! [is_alive $srv]
+        ! [is_alive [dict get $srv pid]]
     } else {
         fail "rdb loading didn't fail"
     }
@@ -146,6 +377,28 @@ test {corrupt payload: load corrupted rdb with no CRC - #3505} {
     assert_equal [count_message_lines $stdout "Terminating server after rdb file reading failure."]  1
     assert_lessthan 1 [count_message_lines $stdout "integrity check failed"]
     kill_server $srv ;# let valgrind look for issues
+}
+
+foreach sanitize_dump {no yes} {
+    test {corrupt payload: load corrupted rdb with empty keys} {
+        set server_path [tmpdir "server.rdb-corruption-empty-keys-test"]
+        exec cp tests/assets/corrupt_empty_keys.rdb $server_path
+        start_server [list overrides [list "dir" $server_path "dbfilename" "corrupt_empty_keys.rdb" "sanitize-dump-payload" $sanitize_dump]] {
+            r select 0
+            assert_equal [r dbsize] 0
+
+            verify_log_message 0 "*skipping empty key: set*" 0
+            verify_log_message 0 "*skipping empty key: list_quicklist*" 0
+            verify_log_message 0 "*skipping empty key: list_quicklist_empty_ziplist*" 0
+            verify_log_message 0 "*skipping empty key: list_ziplist*" 0
+            verify_log_message 0 "*skipping empty key: hash*" 0
+            verify_log_message 0 "*skipping empty key: hash_ziplist*" 0
+            verify_log_message 0 "*skipping empty key: zset*" 0
+            verify_log_message 0 "*skipping empty key: zset_ziplist*" 0
+            verify_log_message 0 "*skipping empty key: zset_listpack*" 0
+            verify_log_message 0 "*empty keys skipped: 9*" 0
+        }
+    }
 }
 
 test {corrupt payload: listpack invalid size header} {
@@ -162,9 +415,8 @@ test {corrupt payload: listpack invalid size header} {
 test {corrupt payload: listpack too long entry len} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
-        r restore key 0 "\x0F\x01\x10\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x02\x40\x55\x55\x00\x00\x00\x0F\x00\x01\x01\x00\x01\x02\x01\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x00\x01\x00\x01\x00\x01\x00\x01\x02\x02\x89\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x61\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x88\x62\x00\x00\x00\x00\x00\x00\x00\x09\x08\x01\xFF\x0A\x01\x00\x00\x09\x00\x40\x63\xC9\x37\x03\xA2\xE5\x68"
         catch {
-            r xinfo stream key full
+            r restore key 0 "\x0F\x01\x10\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x02\x40\x55\x55\x00\x00\x00\x0F\x00\x01\x01\x00\x01\x02\x01\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x00\x01\x00\x01\x00\x01\x00\x01\x02\x02\x89\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x61\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x88\x62\x00\x00\x00\x00\x00\x00\x00\x09\x08\x01\xFF\x0A\x01\x00\x00\x09\x00\x40\x63\xC9\x37\x03\xA2\xE5\x68"
         } err
         assert_equal [count_log_message 0 "crashed by signal"] 0
         assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
@@ -174,9 +426,9 @@ test {corrupt payload: listpack too long entry len} {
 test {corrupt payload: listpack very long entry len} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
-        r restore key 0 "\x0F\x01\x10\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x02\x40\x55\x55\x00\x00\x00\x0F\x00\x01\x01\x00\x01\x02\x01\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x00\x01\x00\x01\x00\x01\x00\x01\x02\x02\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x61\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x9C\x62\x00\x00\x00\x00\x00\x00\x00\x09\x08\x01\xFF\x0A\x01\x00\x00\x09\x00\x63\x6F\x42\x8E\x7C\xB5\xA2\x9D"
         catch {
-            r xinfo stream key full
+            # This will catch migrated payloads from v6.2.x
+            r restore key 0 "\x0F\x01\x10\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x02\x40\x55\x55\x00\x00\x00\x0F\x00\x01\x01\x00\x01\x02\x01\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x00\x01\x00\x01\x00\x01\x00\x01\x02\x02\x88\x31\x00\x00\x00\x00\x00\x00\x00\x09\x88\x61\x00\x00\x00\x00\x00\x00\x00\x09\x88\x32\x00\x00\x00\x00\x00\x00\x00\x09\x9C\x62\x00\x00\x00\x00\x00\x00\x00\x09\x08\x01\xFF\x0A\x01\x00\x00\x09\x00\x63\x6F\x42\x8E\x7C\xB5\xA2\x9D"
         } err
         assert_equal [count_log_message 0 "crashed by signal"] 0
         assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
@@ -194,6 +446,55 @@ test {corrupt payload: listpack too long entry prev len} {
     }
 }
 
+test {corrupt payload: stream listpack entry with corrupt encoding crashes lpFirst} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        # Payload: stream listpack with a valid header but a first entry
+        # whose encoding byte is LP_ENCODING_32BIT_STR (0xF0) declaring a
+        # 0x7FFFFFFF-byte string running past the end of the listpack.
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r RESTORE mystream 0 "\x1B\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x1D\x00\x00\x00\x0A\x00\xF0\xFF\xFF\xFF\x7F\x01\x81\x6B\x02\x00\x01\x02\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\xFF\x01\x01\x00\x01\x00\x00\x00\x01\x00\x40\x64\x40\x64\x00\x00\x00\x0C\x00\x00\x00\x00\x00\x00\x00\x00\x00" REPLACE} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Stream listpack integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: stream entry with invalid lp_count causing infinite loop in reverse iteration} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        r restore key 0 "\x15\x03\x10\x00\x00\x01\x99\x52\xB3\xAC\x2F\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x40\x4F\x40\x5C\x18\x5C\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x00\x01\x20\x03\x00\x19\x20\x1C\x40\x09\x05\x01\x01\x82\x5F\x31\x03\x80\x0D\x00\x02\x20\x0D\x00\x02\xA0\x19\x00\x03\x20\x0B\x02\x82\x5F\x33\xA0\x19\x00\x04\x20\x0D\x00\x04\x20\x19\x00\xFF\x10\x00\x00\x01\x99\x52\xB3\xAC\x32\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x40\x51\x40\x5E\x18\x5E\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x06\x01\x01\x82\x5F\x35\x03\x05\x20\x1E\x00\x01\x60\x0D\x01\x06\x01\x40\x0B\x00\x04\x60\x0B\x02\x82\x5F\x37\x60\x19\x40\x3E\x02\x01\x01\x08\x20\x07\x40\x0B\x40\x00\x02\x82\x5F\x39\x20\x19\x00\xFF\x10\x00\x00\x01\x99\x52\xB3\xAC\x39\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x3B\x40\x49\x18\x49\x00\x00\x00\x15\x00\x02\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x40\x00\x00\x05\x20\x07\x40\x09\xC0\x22\x09\x01\x01\x86\x75\x6E\x69\x71\x75\x65\x07\xA0\x2C\x02\x08\x01\xFF\x0C\x81\x00\x00\x01\x99\x52\xB3\xAC\x39\x01\x81\x00\x00\x01\x99\x52\xB3\xAC\x2F\x00\x00\x00\x0C\x00\x0C\x00\xA4\x99\xB6\x4E\x9D\x69\x79\x6A"
+
+        catch {r XREVRANGE key + -}
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: stream entry with invalid numfields causing infinite loop in reverse iteration} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+
+        r restore key 0 "\x15\x01\x10\x00\x00\x01\x9a\x0e\x68\xdd\x3e\x00\x00\x00\x00\x00\x00\x00\x00\x40\x5c\x5c\x00\x00\x00\x1f\x00\x03\x01\x01\x01\x02\x01\x84\x69\x74\x65\x6d\x05\x85\x76\x61\x6c\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x05\x01\x03\x01\x0e\x01\x00\x01\x01\x01\x82\x5f\x31\x03\x05\x01\x30\x01\x0e\x01\x01\x01\x01\x01\x02\x01\x05\x01\x00\x01\xf3\x91\x20\x13\x17\x05\x00\x01\x01\x01\xf3\x64\x2f\xdf\xe7\x05\xf3\x80\xd3\x91\x1d\x05\x06\x01\xff\x03\x81\x00\x00\x01\x9a\x25\x7b\xfd\xcf\x00\x81\x00\x00\x01\x9a\x0e\x68\xdd\x3e\x00\x81\x00\x00\x01\x9a\x0e\x68\xdd\x4c\x00\x04\x01\x07\x6d\x79\x67\x72\x6f\x75\x70\x81\x00\x00\x01\x9a\x0e\x68\xdd\x4c\x00\x02\x01\x00\x00\x01\x9a\x0e\x68\xdd\x4c\x00\x00\x00\x00\x00\x00\x00\x00\x4d\xdd\x68\x0e\x9a\x01\x00\x00\x01\x01\x05\x41\x6c\x69\x63\x65\x4d\xdd\x68\x0e\x9a\x01\x00\x00\x4d\xdd\x68\x0e\x9a\x01\x00\x00\x01\x00\x00\x01\x9a\x0e\x68\xdd\x4c\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\xd8\xd6\x84\x4e\xc6\xc0\x63\xdb" replace
+        catch {r XREVRANGE key + -}
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: stream with duplicate consumers} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        catch {
+            r restore key 0 "\x0F\x00\x00\x00\x00\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x00\x00\x00\x02\x04\x6E\x61\x6D\x65\x2A\x4C\xAA\x9A\x7D\x01\x00\x00\x00\x04\x6E\x61\x6D\x65\x2B\x4C\xAA\x9A\x7D\x01\x00\x00\x00\x0A\x00\xCC\xED\x8C\xA7\x62\xEE\xC7\xC8"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Duplicate stream consumer detected*" 0
+        r ping
+    }
+}
+
 test {corrupt payload: hash ziplist with duplicate records} {
     # when we do perform full sanitization, we expect duplicate records to fail the restore
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
@@ -204,23 +505,79 @@ test {corrupt payload: hash ziplist with duplicate records} {
     }
 }
 
-test {corrupt payload: hash ziplist uneven record count} {
+test {corrupt payload: hash listpack with duplicate records} {
     # when we do perform full sanitization, we expect duplicate records to fail the restore
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch { r RESTORE _hash 0 "\x10\x17\x17\x00\x00\x00\x04\x00\x82\x61\x00\x03\x82\x62\x00\x03\x82\x61\x00\x03\x82\x64\x00\x03\xff\x0a\x00\xc0\xcf\xa6\x87\xe5\xa7\xc5\xbe" } err
+        assert_match "*Bad data format*" $err
+    }
+}
+
+test {corrupt payload: hash listpack with duplicate records - convert} {
+    # when we do NOT perform full sanitization, but we convert to hash, we expect duplicate records panic
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r config set hash-max-listpack-entries 1
+        r debug set-skip-checksum-validation 1
+        catch { r RESTORE _hash 0 "\x10\x17\x17\x00\x00\x00\x04\x00\x82\x61\x00\x03\x82\x62\x00\x03\x82\x61\x00\x03\x82\x64\x00\x03\xff\x0a\x00\xc0\xcf\xa6\x87\xe5\xa7\xc5\xbe" } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "listpack with dup elements"] 1
+    }
+}
+
+test {corrupt payload: hash ziplist uneven record count} {
+    # when we do NOT perform full sanitization, but shallow sanitization can detect uneven count
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
         catch { r RESTORE _hash 0 "\r\x1b\x1b\x00\x00\x00\x16\x00\x00\x00\x04\x00\x00\x02a\x00\x04\x02b\x00\x04\x02a\x00\x04\x02d\x00\xff\t\x00\xa1\x98\x36x\xcc\x8e\x93\x2e" } err
         assert_match "*Bad data format*" $err
     }
 }
 
-test {corrupt payload: hash dupliacte records} {
+test {corrupt payload: hash duplicate records} {
     # when we do perform full sanitization, we expect duplicate records to fail the restore
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload yes
         r debug set-skip-checksum-validation 1
         catch { r RESTORE _hash 0 "\x04\x02\x01a\x01b\x01a\x01d\t\x00\xc6\x9c\xab\xbc\bk\x0c\x06" } err
         assert_match "*Bad data format*" $err
+    }
+}
+
+test {corrupt payload: hash empty zipmap} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch { r RESTORE _hash 0 "\x09\x02\x00\xFF\x09\x00\xC0\xF1\xB8\x67\x4C\x16\xAC\xE3" } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Zipmap integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: hash zipmap with duplicate keys} {
+    # Craft a structurally valid zipmap with duplicate key "a" to trigger the
+    # dictAdd failure path in rdbLoadObject (RDB_TYPE_HASH_ZIPMAP).
+    # This exercises the error-handling branch that must free the listpack
+    # allocated for the zipmap-to-listpack conversion.
+    #
+    # Zipmap layout (12 bytes):
+    #   \x02           zmlen=2
+    #   \x01 a         key "a" (len 1)
+    #   \x01 \x00 b    value "b" (len 1, free 0)
+    #   \x01 a         key "a" again (duplicate!)
+    #   \x01 \x00 d    value "d" (len 1, free 0)
+    #   \xFF           end
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {
+            r RESTORE _hash 0 "\x09\x0C\x02\x01\x61\x01\x00\x62\x01\x61\x01\x00\x64\xFF\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Hash zipmap with dup elements*" 0
     }
 }
 
@@ -256,23 +613,20 @@ test {corrupt payload: fuzzer findings - NPD in quicklistIndex} {
         r debug set-skip-checksum-validation 1
         catch {
             r RESTORE key 0 "\x0E\x01\x13\x13\x00\x00\x00\x10\x00\x00\x00\x03\x12\x00\xF3\x02\x02\x5F\x31\x04\xF1\xFF\x09\x00\xC9\x4B\x31\xFE\x61\xC0\x96\xFE"
-            r LSET key 290 290
-        }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
-test {corrupt payload: fuzzer findings - invalid read in ziplistFind} {
+test {corrupt payload: fuzzer findings - encoded entry header reach outside the allocation} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
         catch {
             r RESTORE key 0 "\x0D\x19\x19\x00\x00\x00\x16\x00\x00\x00\x06\x00\x00\xF1\x02\xF1\x02\xF2\x02\x02\x5F\x31\x04\x99\x02\xF3\xFF\x09\x00\xC5\xB8\x10\xC0\x8A\xF9\x16\xDF"
-            r HEXISTS key -688319650333
-        }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -301,12 +655,12 @@ test {corrupt payload: fuzzer findings - hash crash} {
 
 test {corrupt payload: fuzzer findings - uneven entry count in hash} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _hashbig 0 "\x0D\x3D\x3D\x00\x00\x00\x38\x00\x00\x00\x14\x00\x00\xF2\x02\x02\x5F\x31\x04\x1C\x02\xF7\x02\xF1\x02\xF1\x02\xF5\x02\xF5\x02\xF4\x02\x02\x5F\x33\x04\xF6\x02\x02\x5F\x35\x04\xF8\x02\x02\x5F\x37\x04\xF9\x02\xF9\x02\xF3\x02\xF3\x02\xFA\x02\x02\x5F\x39\xFF\x09\x00\x73\xB7\x68\xC8\x97\x24\x8E\x88"
-        catch { r HSCAN _hashbig -250 }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {
+            r RESTORE _hashbig 0 "\x0D\x3D\x3D\x00\x00\x00\x38\x00\x00\x00\x14\x00\x00\xF2\x02\x02\x5F\x31\x04\x1C\x02\xF7\x02\xF1\x02\xF1\x02\xF5\x02\xF5\x02\xF4\x02\x02\x5F\x33\x04\xF6\x02\x02\x5F\x35\x04\xF8\x02\x02\x5F\x37\x04\xF9\x02\xF9\x02\xF3\x02\xF3\x02\xFA\x02\x02\x5F\x39\xFF\x09\x00\x73\xB7\x68\xC8\x97\x24\x8E\x88"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -328,23 +682,23 @@ test {corrupt payload: fuzzer findings - leak in rdbloading due to dup entry in 
     }
 }
 
-test {corrupt payload: fuzzer findings - empty intset div by zero} {
+test {corrupt payload: fuzzer findings - empty intset} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _setbig 0 "\x02\xC0\xC0\x06\x02\x5F\x39\xC0\x02\x02\x5F\x33\xC0\x00\x02\x5F\x31\xC0\x04\xC0\x08\x02\x5F\x37\x02\x5F\x35\x09\x00\xC5\xD4\x6D\xBA\xAD\x14\xB7\xE7"
-        catch {r SRANDMEMBER _setbig }
+        catch {r RESTORE _setbig 0 "\x02\xC0\xC0\x06\x02\x5F\x39\xC0\x02\x02\x5F\x33\xC0\x00\x02\x5F\x31\xC0\x04\xC0\x08\x02\x5F\x37\x02\x5F\x35\x09\x00\xC5\xD4\x6D\xBA\xAD\x14\xB7\xE7"} err
+        assert_match "*Bad data format*" $err
+        r ping
     }
 }
 
-test {corrupt payload: fuzzer findings - valgrind ziplist - crash report prints freed memory} {
+test {corrupt payload: fuzzer findings - zset ziplist entry lensize is 0} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _zsetbig 0 "\x0C\x3D\x3D\x00\x00\x00\x3A\x00\x00\x00\x14\x00\x00\xF1\x02\xF1\x02\x02\x5F\x31\x04\xF2\x02\xF3\x02\xF3\x02\x02\x5F\x33\x04\xF4\x02\xEE\x02\xF5\x02\x02\x5F\x35\x04\xF6\x02\xF7\x02\xF7\x02\x02\x5F\x37\x04\xF8\x02\xF9\x02\xF9\x02\x02\x5F\x39\x04\xFA\xFF\x09\x00\xAE\xF9\x77\x2A\x47\x24\x33\xF6"
-        catch { r ZREMRANGEBYSCORE _zsetbig -1050966020 724 }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r RESTORE _zsetbig 0 "\x0C\x3D\x3D\x00\x00\x00\x3A\x00\x00\x00\x14\x00\x00\xF1\x02\xF1\x02\x02\x5F\x31\x04\xF2\x02\xF3\x02\xF3\x02\x02\x5F\x33\x04\xF4\x02\xEE\x02\xF5\x02\x02\x5F\x35\x04\xF6\x02\xF7\x02\xF7\x02\x02\x5F\x37\x04\xF8\x02\xF9\x02\xF9\x02\x02\x5F\x39\x04\xFA\xFF\x09\x00\xAE\xF9\x77\x2A\x47\x24\x33\xF6"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Zset ziplist integrity check failed*" 0
     }
 }
 
@@ -352,12 +706,9 @@ test {corrupt payload: fuzzer findings - valgrind ziplist prevlen reaches outsid
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _listbig 0 "\x0E\x02\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\x02\x5F\x39\x04\xF9\x02\x02\x5F\x37\x04\xF7\x02\x02\x5F\x35\xFF\x19\x19\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\xF5\x02\x02\x5F\x33\x04\xF3\x95\x02\x5F\x31\x04\xF1\xFF\x09\x00\x0C\xFC\x99\x2C\x23\x45\x15\x60"
-        catch { r RPOP _listbig }
-        catch { r RPOP _listbig }
-        catch { r RPUSH _listbig 949682325 }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r RESTORE _listbig 0 "\x0E\x02\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\x02\x5F\x39\x04\xF9\x02\x02\x5F\x37\x04\xF7\x02\x02\x5F\x35\xFF\x19\x19\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\xF5\x02\x02\x5F\x33\x04\xF3\x95\x02\x5F\x31\x04\xF1\xFF\x09\x00\x0C\xFC\x99\x2C\x23\x45\x15\x60"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -374,11 +725,9 @@ test {corrupt payload: fuzzer findings - valgrind ziplist prev too big} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _list 0 "\x0E\x01\x13\x13\x00\x00\x00\x10\x00\x00\x00\x03\x00\x00\xF3\x02\x02\x5F\x31\xC1\xF1\xFF\x09\x00\xC9\x4B\x31\xFE\x61\xC0\x96\xFE"
-        catch { r RPUSHX _list -45 }
-        catch { r LREM _list -748 -840}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r RESTORE _list 0 "\x0E\x01\x13\x13\x00\x00\x00\x10\x00\x00\x00\x03\x00\x00\xF3\x02\x02\x5F\x31\xC1\xF1\xFF\x09\x00\xC9\x4B\x31\xFE\x61\xC0\x96\xFE"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
 
@@ -432,17 +781,18 @@ test {corrupt payload: fuzzer findings - infinite loop} {
     }
 }
 
-test {corrupt payload: fuzzer findings - hash convert asserts on RESTORE with shallow sanitization} {
-    # if we don't perform full sanitization, and the next command can assert on converting
-    # a ziplist to hash records, then we're ok with that happning in RESTORE too
+test {corrupt payload: fuzzer findings - hash ziplist too long entry len} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
-        r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        catch { r RESTORE _hash 0 "\x0D\x3D\x3D\x00\x00\x00\x3A\x00\x00\x00\x14\x13\x00\xF5\x02\xF5\x02\xF2\x02\x53\x5F\x31\x04\xF3\x02\xF3\x02\xF7\x02\xF7\x02\xF8\x02\x02\x5F\x37\x04\xF1\x02\xF1\x02\xF6\x02\x02\x5F\x35\x04\xF4\x02\x02\x5F\x33\x04\xFA\x02\x02\x5F\x39\x04\xF9\x02\xF9\xFF\x09\x00\xB5\x48\xDE\x62\x31\xD0\xE5\x63" }
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {
+            r RESTORE _hash 0 "\x0D\x3D\x3D\x00\x00\x00\x3A\x00\x00\x00\x14\x13\x00\xF5\x02\xF5\x02\xF2\x02\x53\x5F\x31\x04\xF3\x02\xF3\x02\xF7\x02\xF7\x02\xF8\x02\x02\x5F\x37\x04\xF1\x02\xF1\x02\xF6\x02\x02\x5F\x35\x04\xF4\x02\x02\x5F\x33\x04\xFA\x02\x02\x5F\x39\x04\xF9\x02\xF9\xFF\x09\x00\xB5\x48\xDE\x62\x31\xD0\xE5\x63"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
     }
 }
+
+if {$run_oom_tests} {
 
 test {corrupt payload: OOM in rdbGenericLoadStringObject} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
@@ -461,17 +811,17 @@ test {corrupt payload: fuzzer findings - OOM in dictExpand} {
         assert_match "*Bad data format*" $err
         r ping
     }
+} {} {tsan:skip}
+
 }
 
-test {corrupt payload: fuzzer findings - invalid tail offset after removal} {
+test {corrupt payload: fuzzer findings - zset ziplist invalid tail offset} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         r debug set-skip-checksum-validation 1
-        r RESTORE _zset 0 "\x0C\x19\x19\x00\x00\x00\x02\x00\x00\x00\x06\x00\x00\xF1\x02\xF1\x02\x02\x5F\x31\x04\xF2\x02\xF3\x02\xF3\xFF\x09\x00\x4D\x72\x7B\x97\xCD\x9A\x70\xC1"
-        catch {r ZPOPMIN _zset}
-        catch {r ZPOPMAX _zset}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r RESTORE _zset 0 "\x0C\x19\x19\x00\x00\x00\x02\x00\x00\x00\x06\x00\x00\xF1\x02\xF1\x02\x02\x5F\x31\x04\xF2\x02\xF3\x02\xF3\xFF\x09\x00\x4D\x72\x7B\x97\xCD\x9A\x70\xC1"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Zset ziplist integrity check failed*" 0
     }
 }
 
@@ -507,14 +857,13 @@ test {corrupt payload: fuzzer findings - valgrind invalid read} {
     }
 }
 
-test {corrupt payload: fuzzer findings - HRANDFIELD on bad ziplist} {
+test {corrupt payload: fuzzer findings - empty hash ziplist} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload yes
         r debug set-skip-checksum-validation 1
-        r RESTORE _int 0 "\x04\xC0\x01\x09\x00\xF6\x8A\xB6\x7A\x85\x87\x72\x4D"
-        catch {r HRANDFIELD _int}
-        assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        catch {r RESTORE _int 0 "\x04\xC0\x01\x09\x00\xF6\x8A\xB6\x7A\x85\x87\x72\x4D"} err
+        assert_match "*Bad data format*" $err
+        r ping
     }
 }
 
@@ -529,5 +878,505 @@ test {corrupt payload: fuzzer findings - stream with no records} {
     }
 }
 
-} ;# tags
+test {corrupt payload: fuzzer findings - quicklist ziplist tail followed by extra data which start with 0xff} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {
+            r restore key 0 "\x0E\x01\x11\x11\x00\x00\x00\x0A\x00\x00\x00\x01\x00\x00\xF6\xFF\xB0\x6C\x9C\xFF\x09\x00\x9C\x37\x47\x49\x4D\xDE\x94\xF5" replace
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
 
+test {corrupt payload: fuzzer findings - dict init to huge size} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\x02\x81\xC0\x00\x02\x5F\x31\xC0\x02\x09\x00\xB2\x1B\xE5\x17\x2E\x15\xF4\x6C" replace} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+} {} {tsan:skip}
+
+test {corrupt payload: fuzzer findings - huge string} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\x00\x81\x01\x09\x00\xF6\x2B\xB6\x7A\x85\x87\x72\x4D"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+} {} {tsan:skip}
+
+test {corrupt payload: fuzzer findings - stream PEL without consumer} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _stream 0 "\x0F\x01\x10\x00\x00\x01\x7B\x08\xF0\xB2\x34\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x3B\x40\x42\x19\x42\x00\x00\x00\x18\x00\x02\x01\x01\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x20\x10\x00\x00\x20\x01\x00\x01\x20\x03\x02\x05\x01\x03\x20\x05\x40\x00\x04\x82\x5F\x31\x03\x05\x60\x19\x80\x32\x02\x05\x01\xFF\x02\x81\x00\x00\x01\x7B\x08\xF0\xB2\x34\x02\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x7B\x08\xF0\xB2\x34\x01\x01\x00\x00\x01\x7B\x08\xF0\xB2\x34\x00\x00\x00\x00\x00\x00\x00\x01\x35\xB2\xF0\x08\x7B\x01\x00\x00\x01\x01\x13\x41\x6C\x69\x63\x65\x35\xB2\xF0\x08\x7B\x01\x00\x00\x01\x00\x00\x01\x7B\x08\xF0\xB2\x34\x00\x00\x00\x00\x00\x00\x00\x01\x09\x00\x28\x2F\xE0\xC5\x04\xBB\xA7\x31"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - stream listpack valgrind issue} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        r restore _stream 0 "\x0F\x01\x10\x00\x00\x01\x7B\x09\x5E\x94\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x02\x01\x01\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x05\x01\x03\x01\x25\x01\x00\x01\x01\x01\x82\x5F\x31\x03\x05\x01\x02\x01\x32\x01\x00\x01\x01\x01\x02\x01\xF0\x01\xFF\x02\x81\x00\x00\x01\x7B\x09\x5E\x95\x31\x00\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x7B\x09\x5E\x95\x24\x00\x01\x00\x00\x01\x7B\x09\x5E\x95\x24\x00\x00\x00\x00\x00\x00\x00\x00\x5C\x95\x5E\x09\x7B\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\x4B\x95\x5E\x09\x7B\x01\x00\x00\x01\x00\x00\x01\x7B\x09\x5E\x95\x24\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x19\x29\x94\xDF\x76\xF8\x1A\xC6"
+        catch {r XINFO STREAM _stream FULL }
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: fuzzer findings - stream with bad lpFirst} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _stream 0 "\x0F\x01\x10\x00\x00\x01\x7B\x0E\x52\xD2\xEC\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x02\xF7\x01\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x05\x01\x03\x01\x01\x01\x00\x01\x01\x01\x82\x5F\x31\x03\x05\x01\x02\x01\x01\x01\x01\x01\x01\x01\x02\x01\x05\x01\xFF\x02\x81\x00\x00\x01\x7B\x0E\x52\xD2\xED\x01\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x7B\x0E\x52\xD2\xED\x00\x01\x00\x00\x01\x7B\x0E\x52\xD2\xED\x00\x00\x00\x00\x00\x00\x00\x00\xED\xD2\x52\x0E\x7B\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\xED\xD2\x52\x0E\x7B\x01\x00\x00\x01\x00\x00\x01\x7B\x0E\x52\xD2\xED\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\xAC\x05\xC9\x97\x5D\x45\x80\xB3"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - stream listpack lpPrev valgrind issue} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        r restore _stream 0  "\x0F\x01\x10\x00\x00\x01\x7B\x0E\xAE\x66\x36\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x02\x01\x01\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x1D\x01\x03\x01\x24\x01\x00\x01\x01\x69\x82\x5F\x31\x03\x05\x01\x02\x01\x33\x01\x00\x01\x01\x01\x02\x01\x05\x01\xFF\x02\x81\x00\x00\x01\x7B\x0E\xAE\x66\x69\x00\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x7B\x0E\xAE\x66\x5A\x00\x01\x00\x00\x01\x7B\x0E\xAE\x66\x5A\x00\x00\x00\x00\x00\x00\x00\x00\x94\x66\xAE\x0E\x7B\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\x83\x66\xAE\x0E\x7B\x01\x00\x00\x01\x00\x00\x01\x7B\x0E\xAE\x66\x5A\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\xD5\xD7\xA5\x5C\x63\x1C\x09\x40"
+        catch {r XREVRANGE _stream 1618622681 606195012389}
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: fuzzer findings - stream with non-integer entry id} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _streambig 0 "\x0F\x03\x10\x00\x00\x01\x7B\x13\x34\xC3\xB2\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x40\x4F\x40\x5C\x18\x5C\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x80\x20\x01\x00\x01\x20\x03\x00\x05\x20\x1C\x40\x09\x05\x01\x01\x82\x5F\x31\x03\x80\x0D\x00\x02\x20\x0D\x00\x02\xA0\x19\x00\x03\x20\x0B\x02\x82\x5F\x33\xA0\x19\x00\x04\x20\x0D\x00\x04\x20\x19\x00\xFF\x10\x00\x00\x01\x7B\x13\x34\xC3\xB2\x00\x00\x00\x00\x00\x00\x00\x05\xC3\x40\x56\x40\x61\x18\x61\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x06\x01\x01\x82\x5F\x35\x03\x05\x20\x1E\x40\x0B\x03\x01\x01\x06\x01\x40\x0B\x03\x01\x01\xDF\xFB\x20\x05\x02\x82\x5F\x37\x60\x1A\x20\x0E\x00\xFC\x20\x05\x00\x08\xC0\x1B\x00\xFD\x20\x0C\x02\x82\x5F\x39\x20\x1B\x00\xFF\x10\x00\x00\x01\x7B\x13\x34\xC3\xB3\x00\x00\x00\x00\x00\x00\x00\x03\xC3\x3D\x40\x4A\x18\x4A\x00\x00\x00\x15\x00\x02\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x40\x00\x00\x05\x60\x07\x02\xDF\xFD\x02\xC0\x23\x09\x01\x01\x86\x75\x6E\x69\x71\x75\x65\x07\xA0\x2D\x02\x08\x01\xFF\x0C\x81\x00\x00\x01\x7B\x13\x34\xC3\xB4\x00\x00\x09\x00\x9D\xBD\xD5\xB9\x33\xC4\xC5\xFF"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - empty quicklist} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {
+            r restore key 0 "\x0E\xC0\x2B\x15\x00\x00\x00\x0A\x00\x00\x00\x01\x00\x00\xE0\x62\x58\xEA\xDF\x22\x00\x00\x00\xFF\x09\x00\xDF\x35\xD2\x67\xDC\x0E\x89\xAB" replace
+        } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - empty zset} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\x05\xC0\x01\x09\x00\xF6\x8A\xB6\x7A\x85\x87\x72\x4D"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - hash with len of 0} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\x04\xC0\x21\x09\x00\xF6\x8A\xB6\x7A\x85\x87\x72\x4D"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - hash listpack first element too long entry len} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload yes
+        catch { r restore _hash 0 "\x10\x15\x15\x00\x00\x00\x06\x00\xF0\x01\x00\x01\x01\x01\x82\x5F\x31\x03\x02\x01\x02\x01\xFF\x0A\x00\x94\x21\x0A\xFA\x06\x52\x9F\x44" replace } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: fuzzer findings - stream double free listpack when insert dup node to rax returns 0} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload yes
+        catch { r restore _stream 0 "\x0F\x03\x10\x00\x00\x01\x7B\x60\x5A\x23\x79\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x40\x4F\x40\x5C\x18\x5C\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x00\x01\x20\x03\x00\x05\x20\x1C\x40\x09\x05\x01\x01\x82\x5F\x31\x03\x80\x0D\x00\x02\x20\x0D\x00\x02\xA0\x19\x00\x03\x20\x0B\x02\x82\x5F\x33\xA0\x19\x00\x04\x20\x0D\x00\x04\x20\x19\x00\xFF\x10\x00\x00\x01\x7B\x60\x5A\x23\x79\x00\x00\x00\x00\x00\x00\x00\x05\xC3\x40\x51\x40\x5E\x18\x5E\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x06\x01\x01\x82\x5F\x35\x03\x05\x20\x1E\x40\x0B\x03\x01\x01\x06\x01\x80\x0B\x00\x02\x20\x0B\x02\x82\x5F\x37\xA0\x19\x00\x03\x20\x0D\x00\x08\xA0\x19\x00\x04\x20\x0B\x02\x82\x5F\x39\x20\x19\x00\xFF\x10\x00\x00\x01\x7B\x60\x5A\x23\x79\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x3B\x40\x49\x18\x49\x00\x00\x00\x15\x00\x02\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x40\x00\x00\x05\x20\x07\x40\x09\xC0\x22\x09\x01\x01\x86\x75\x6E\x69\x71\x75\x65\x07\xA0\x2C\x02\x08\x01\xFF\x0C\x81\x00\x00\x01\x7B\x60\x5A\x23\x7A\x01\x00\x0A\x00\x9C\x8F\x1E\xBF\x2E\x05\x59\x09" replace } err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - LCS OOM} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r SETRANGE _int 423324 1450173551
+        catch {r LCS _int _int} err
+        assert_match "*Insufficient memory*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - gcc asan reports false leak on assert} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload no
+        catch { r restore _list 0 "\x12\x01\x02\x13\x13\x00\x00\x00\x10\x00\x00\x00\x03\x00\x00\xF3\xFE\x02\x5F\x31\x04\xF1\xFF\x0A\x00\x19\x8D\x3D\x74\x85\x94\x29\xBD" }
+        catch { r LPOP _list } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: fuzzer findings - lpFind invalid access} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload no
+         r restore _hashbig 0 "\x10\x39\x39\x00\x00\x00\x14\x00\x06\x01\x06\x01\x03\x01\x82\x5F\x33\x03\x07\x01\x82\x5F\x37\x03\x00\x01\x00\x01\x04\x01\x04\x01\x09\x01\x82\x5F\x39\x03\x05\x01\x82\x5F\x35\x03\x08\x01\x08\x01\x01\x01\x82\x5F\x31\x03\x02\x01\xF0\x01\xFF\x0A\x00\x29\xD7\xE4\x52\x79\x7A\x95\x82"
+         catch { r HLEN _hashbig }
+         catch { r HSETNX _hashbig 513072881620 "\x9A\x4B\x1F\xF2\x99\x74\x6E\x96\x84\x7F\xB9\x85\xBE\xD6\x1A\x93\x0A\xED\xAE\x19\xA0\x5A\x67\xD6\x89\xA8\xF9\xF2\xB8\xBD\x3E\x5A\xCF\xD2\x5B\x17\xA4\xBB\xB2\xA9\x56\x67\x6E\x0B\xED\xCD\x36\x49\xC6\x84\xFF\xC2\x76\x9B\xF3\x49\x88\x97\x92\xD2\x54\xE9\x08\x19\x86\x40\x96\x24\x68\x25\x9D\xF7\x0E\xB7\x36\x85\x68\x6B\x2A\x97\x64\x30\xE6\xFF\x9A\x2A\x42\x2B\x31\x01\x32\xB3\xEE\x78\x1A\x26\x94\xE2\x07\x34\x50\x8A\xFF\xF9\xAE\xEA\xEC\x59\x42\xF5\x39\x40\x65\xDE\x55\xCC\x77\x1B\x32\x02\x19\xEE\x3C\xD4\x79\x48\x01\x4F\x51\xFE\x22\xE0\x0C\xF4\x07\x06\xCD\x55\x30\xC0\x24\x32\xD4\xCC\xAF\x82\x05\x48\x14\x10\x55\xA1\x3D\xF6\x81\x45\x54\xEA\x71\x24\x27\x06\xDC\xFA\xE4\xE4\x87\xCC\x81\xA0\x47\xA5\xAF\xD1\x89\xE7\x42\xC3\x24\xD0\x32\x7A\xDE\x44\x47\x6E\x1F\xCB\xEE\xA6\x46\xDE\x0D\xE6\xD5\x16\x03\x2A\xD6\x9E\xFD\x94\x02\x2C\xDB\x1F\xD0\xBE\x98\x10\xE3\xEB\xEA\xBE\xE5\xD1" }
+    }
+}
+
+test {corrupt payload: fuzzer findings - invalid access in ziplist tail prevlen decoding} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r debug set-skip-checksum-validation 1
+        r config set sanitize-dump-payload no
+        catch {r restore _listbig 0 "\x0e\x02\x1B\x1B\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\x02\x5F\x39\x04\xF9\x02\x02\x5F\x37\x04\xF7\x02\x02\x5F\x35\xFF\x19\x19\x00\x00\x00\x16\x00\x00\x00\x05\x00\x00\xF5\x02\x02\x5F\x33\x04\xF3\x02\x02\x5F\x31\xFE\xF1\xFF\x0A\x00\x6B\x43\x32\x2F\xBB\x29\x0a\xBE"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - zset zslInsert with a NAN score} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r restore _nan_zset 0 "\x05\x0A\x02\x5F\x39\x00\x00\x00\x00\x00\x00\x22\x40\xC0\x08\x00\x00\x00\x00\x00\x00\x20\x40\x02\x5F\x37\x00\x00\x00\x00\x00\x00\x1C\x40\xC0\x06\x00\x00\x00\x00\x00\x00\x18\x40\x02\x5F\x35\x00\x00\x00\x00\x00\x00\x14\x40\xC0\x04\x00\x00\x00\x00\x00\x00\x10\x40\x02\x5F\x33\x00\x00\x00\x00\x00\x00\x08\x40\xC0\x02\x00\x00\x00\x00\x00\x00\x00\x40\x02\x5F\x31\x00\x00\x00\x00\x00\x55\xF0\x7F\xC0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0A\x00\xEC\x94\x86\xD8\xFD\x5C\x5F\xD8"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - streamLastValidID panic} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _streambig 0 "\x13\xC0\x10\x00\x00\x01\x80\x20\x48\xA0\x33\x00\x00\x00\x00\x00\x00\x00\x00\xC3\x40\x4F\x40\x5C\x18\x5C\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x00\x01\x20\x03\x00\x05\x20\x1C\x40\x09\x05\x01\x01\x82\x5F\x31\x03\x80\x0D\x00\x02\x20\x0D\x00\x02\xA0\x19\x00\x03\x20\x0B\x02\x82\x5F\x33\x60\x19\x40\x2F\x02\x01\x01\x04\x20\x19\x00\xFF\x10\x00\x00\x01\x80\x20\x48\xA0\x34\x00\x00\x00\x00\x00\x00\x00\x01\xC3\x40\x51\x40\x5E\x18\x5E\x00\x00\x00\x24\x00\x05\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x06\x01\x01\x82\x5F\x35\x03\x05\x20\x1E\x40\x0B\x03\x01\x01\x06\x01\x80\x0B\x00\x02\x20\x0B\x02\x82\x5F\x37\xA0\x19\x00\x03\x20\x0D\x00\x08\xA0\x19\x00\x04\x20\x0B\x02\x82\x5F\x39\x20\x19\x00\xFF\x10\x00\x00\x01\x80\x20\x48\xA0\x34\x00\x00\x00\x00\x00\x00\x00\x06\xC3\x3D\x40\x4A\x18\x4A\x00\x00\x00\x15\x00\x02\x01\x00\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x40\x10\x00\x00\x20\x01\x40\x00\x00\x05\x60\x07\x02\xDF\xFA\x02\xC0\x23\x09\x01\x01\x86\x75\x6E\x69\x71\x75\x65\x07\xA0\x2D\x02\x08\x01\xFF\x0C\x81\x00\x00\x01\x80\x20\x48\xA0\x35\x00\x81\x00\x00\x01\x80\x20\x48\xA0\x33\x00\x00\x00\x0C\x00\x0A\x00\x34\x8B\x0E\x5B\x42\xCD\xD6\x08"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - valgrind fishy value warning} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _key 0 "\x13\x01\x10\x00\x00\x01\x81\xCC\x07\xDC\xF2\x00\x00\x00\x00\x00\x00\x00\x00\x40\x42\x42\x00\x00\x00\x18\x00\x02\x01\x01\x01\x02\x01\x84\x69\x74\x65\x6D\x05\x85\x76\x61\x6C\x75\x65\x06\x00\x01\x02\x01\x00\x01\x00\x01\x01\x01\x00\x01\x05\x01\x03\x01\x2C\x01\x00\x01\x01\x01\x82\x5F\x31\x03\x05\x01\x02\x01\x3C\x01\x00\x01\x01\x01\x02\x01\x05\x01\xFF\x02\xD0\x00\x00\x01\x81\xCC\x07\xDD\x2E\x00\x81\x00\x00\x01\x81\xCC\x07\xDC\xF2\x00\x81\x00\x00\x01\x81\xCC\x07\xDD\x1E\x00\x03\x01\x07\x6D\x79\x67\x72\x6F\x75\x70\x81\x00\x00\x01\x81\xCC\x07\xDD\x1E\x00\x02\x01\x00\x00\x01\x81\xCC\x07\xDD\x1E\x00\x00\x00\x00\x00\x00\x00\x00\x71\xDD\x07\xCC\x81\x01\x00\x00\x01\x01\x05\x41\x6C\x69\x63\x65\x58\xDD\x07\xCC\x81\x01\x00\x00\x01\x00\x00\x01\x81\xCC\x07\xDD\x1E\x00\x00\x00\x00\x00\x00\x00\x00\x0A\x00\x2F\xB0\xD1\x15\x0A\x97\x87\x6B"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - empty set listpack} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r restore _key 0 "\x14\x25\x25\x00\x00\x00\x00\x00\x02\x01\x82\x5F\x37\x03\x06\x01\x82\x5F\x35\x03\x82\x5F\x33\x03\x00\x01\x82\x5F\x31\x03\x82\x5F\x39\x03\x04\xA9\x08\x01\xFF\x0B\x00\xA3\x26\x49\xB4\x86\xB0\x0F\x41"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - set with duplicate elements causes sdiff to hang} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _key 0 "\x14\x25\x25\x00\x00\x00\x0A\x00\x06\x01\x82\x5F\x35\x03\x04\x01\x82\x5F\x31\x03\x82\x5F\x33\x03\x00\x01\x82\x5F\x39\x03\x82\x5F\x33\x03\x08\x01\x02\x01\xFF\x0B\x00\x31\xBE\x7D\x41\x01\x03\x5B\xEC" replace} err
+        assert_match "*Bad data format*" $err
+        r ping
+
+        # In the past, it generated a broken protocol and left the client hung in sdiff
+        r config set sanitize-dump-payload no
+        assert_equal {OK} [r restore _key 0 "\x14\x25\x25\x00\x00\x00\x0A\x00\x06\x01\x82\x5F\x35\x03\x04\x01\x82\x5F\x31\x03\x82\x5F\x33\x03\x00\x01\x82\x5F\x39\x03\x82\x5F\x33\x03\x08\x01\x02\x01\xFF\x0B\x00\x31\xBE\x7D\x41\x01\x03\x5B\xEC" replace]
+        assert_type set _key
+        assert_encoding listpack _key
+        assert_equal 10 [r scard _key]
+        assert_equal {0 2 4 6 8 _1 _3 _3 _5 _9} [lsort [r smembers _key]]
+        assert_equal {0 2 4 6 8 _1 _3 _5 _9} [lsort [r sdiff _key]]
+    }
+} {} {logreqres:skip} ;# This test violates {"uniqueItems": true}
+
+test {corrupt payload: fuzzer findings - set with invalid length causes smembers to hang} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        # In the past, it generated a broken protocol and left the client hung in smembers
+        r config set sanitize-dump-payload no
+        assert_equal {OK} [r restore _set 0 "\x14\x16\x16\x00\x00\x00\x0c\x00\x81\x61\x02\x81\x62\x02\x81\x63\x02\x01\x01\x02\x01\x03\x01\xff\x0c\x00\x91\x00\x56\x73\xc1\x82\xd5\xbd" replace]
+        assert_encoding listpack _set
+        catch { r SMEMBERS _set } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: fuzzer findings - set with invalid length causes sscan to hang} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        # In the past, it generated a broken protocol and left the client hung in smembers
+        r config set sanitize-dump-payload no
+        assert_equal {OK} [r restore _set 0 "\x14\x16\x16\x00\x00\x00\x0c\x00\x81\x61\x02\x81\x62\x02\x81\x63\x02\x01\x01\x02\x01\x03\x01\xff\x0c\x00\x91\x00\x56\x73\xc1\x82\xd5\xbd" replace]
+        assert_encoding listpack _set
+        catch { r SSCAN _set 0 } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: zset listpack encoded with invalid length causes zscan to hang} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        assert_equal {OK} [r restore _zset 0 "\x11\x16\x16\x00\x00\x00\x1a\x00\x81\x61\x02\x01\x01\x81\x62\x02\x02\x01\x81\x63\x02\x03\x01\xff\x0c\x00\x81\xa7\xcd\x31\x22\x6c\xef\xf7" replace]
+        assert_encoding listpack _zset
+        catch { r ZSCAN _zset 0 } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: hash listpack encoded with invalid length causes hscan to hang} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        assert_equal {OK} [r restore _hash 0 "\x10\x17\x17\x00\x00\x00\x0e\x00\x82\x66\x31\x03\x82\x76\x31\x03\x82\x66\x32\x03\x82\x76\x32\x03\xff\x0c\x00\xf1\xc5\x36\x92\x29\x6a\x8c\xc5" replace]
+        assert_encoding listpack _hash
+        catch { r HSCAN _hash 0 } err
+        assert_equal [count_log_message 0 "crashed by signal"] 0
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+    }
+}
+
+test {corrupt payload: fuzzer findings - vector sets with wrong encoding} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        catch {r restore _key 0 "\x07\x81\xBD\xE7\x2D\xA2\xBB\x1E\xB4\x00\x02\x03\x02\x03\x02\x50\x8F\x02\x00\x05\xC0\x02\x05\x03\x7F\x7F\x7F\x02\x07\x02\x03\x02\x00\x02\x02\x02\x20\x02\x01\x02\x02\x02\x81\x3F\x13\xCD\x3A\x3F\xDD\xB3\xD7\x05\xC0\x01\x05\x03\x7F\x7F\x7F\x02\x0B\x02\x02\x02\x02\x02\x02\x02\x20\x02\x01\x02\x03\x02\x06\x02\x10\x02\x00\x02\x10\x02\x81\x3F\x13\xCD\x3A\x3F\xDD\xB3\xD7\x05\xC0\x00\x05\x03\x7F\x7F\x7F\x02\x07\x02\x01\x02\x00\x02\x02\x02\x20\x02\x02\x02\x03\x02\x81\x3F\x13\xCD\x3A\x3F\xDD\xB3\xD7\x00\x0C\x00\xC6\xA3\x70\x40\x02\x26\xE8\x9B"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: fuzzer findings - decrRefCount on NULL robj on corrupt KEY_META payload} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        catch {r restore key 0 "\xF3\x02\x01\x0D\x00\x54\x23\x3F\xC9\x82\x32\x05\x8D" replace} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: stream with NACK shared between two consumers} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r debug set-skip-checksum-validation 1
+        # Payload: stream with entry 1-0, one consumer group (mygroup),
+        # two consumers whose PELs both reference 1-0 (shared NACK).
+        # XACK on one consumer frees the NACK, leaving a dangling
+        # pointer in the other consumer's PEL (use-after-free).
+        catch {r RESTORE mystream 0 "\x1a\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x1d\x1d\x00\x00\x00\x0a\x00\x01\x01\x00\x01\x01\x01\x81\x6b\x02\x00\x01\x02\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\xff\x01\x01\x00\x01\x00\x00\x00\x01\x01\x07\x6d\x79\x67\x72\x6f\x75\x70\x01\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x64\x42\xb9\x9d\x01\x00\x00\x01\x02\x09\x63\x6f\x6e\x73\x75\x6d\x65\x72\x41\x01\x64\x42\xb9\x9d\x01\x00\x00\x01\x64\x42\xb9\x9d\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x09\x63\x6f\x6e\x73\x75\x6d\x65\x72\x42\x01\x64\x42\xb9\x9d\x01\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x40\x64\x40\x64\x00\x00\x00\x0d\x00\xe7\x12\xf7\xcc\x25\xd5\x0e\x44"} err
+        catch {r XACK mystream mygroup 1-0} _
+        catch {r XREADGROUP GROUP mygroup consumerA COUNT 10 STREAMS mystream 0} _
+        catch {r DEL mystream} _
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: stream listpack with wrong deleted count in header} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        # Payload: stream whose listpack header says deleted_count = 1
+        # but the only entry is live.
+        catch {r RESTORE mystream 0 "\x1A\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x1D\x00\x00\x00\x0A\x00\x01\x01\x00\x01\x01\x01\x81\x6B\x02\x00\x01\x03\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\xFF\x01\x01\x00\x01\x00\x00\x00\x01\x00\x40\x64\x40\x64\x00\x00\x00\x0D\x00\xBD\x89\x4D\xF3\x41\xC5\xE0\x8E" REPLACE} err
+        catch {r XREAD COUNT 1 STREAMS mystream $} _
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: stream length inconsistent with live entries} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r debug set-skip-checksum-validation 1
+        # Payload: listpack has master.count=1 (lp_live=1) so the lp_live <= 0
+        # guard passes, but s->length=2 while live_entries accumulates to 1.
+        # Exercises the s->length != live_entries check in rdb.c.
+        catch {r RESTORE mystream 0 "\x1A\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x1D\x00\x00\x00\x0A\x00\x01\x01\x01\x01\x01\x01\x81\x6B\x02\x00\x01\x03\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\xFF\x02\x01\x00\x01\x00\x00\x00\x01\x00\x40\x64\x40\x64\x00\x00\x00\x0D\x00\xBD\x89\x4D\xF3\x41\xC5\xE0\x8E" REPLACE} err
+        catch {r XREAD COUNT 1 STREAMS mystream $} _
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: stream all-tombstone listpack with zero length} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r debug set-skip-checksum-validation 1
+        # Payload: listpack has lp_live = 0 (only a tombstone entry) and
+        # s->length = 0. With lp_live rejected only on < 0 this would load
+        # silently into an inconsistent state (raxSize > 0, length = 0);
+        # the <= 0 check rejects it at the listpack header.
+        catch {r RESTORE mystream 0 "\x1A\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x1D\x00\x00\x00\x0A\x00\x00\x01\x01\x01\x01\x01\x81\x6B\x02\x00\x01\x03\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\xFF\x00\x01\x00\x01\x00\x00\x00\x01\x00\x40\x64\x40\x64\x00\x00\x00\x0D\x00\xBD\x89\x4D\xF3\x41\xC5\xE0\x8E" REPLACE} err
+        catch {r XREAD COUNT 1 STREAMS mystream $} _
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: stream live entry count integer overflow bypasses length check} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        # Three listpacks whose lp_live counts sum to exactly 2^64, wrapping
+        # live_entries (uint64_t) back to 0.  Stream length is also set to 0, so
+        # without the overflow guard the s->length != live_entries check passes,
+        # silently accepting a structurally broken stream.
+        # (LLONG_MAX + LLONG_MAX + 2 = 2^64 => live_entries wraps to 0)
+        catch {r RESTORE mystream 0 "\x0F\x03\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x11\x11\x00\x00\x00\x01\x00\xF4\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F\x09\xFF\x10\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x11\x11\x00\x00\x00\x01\x00\xF4\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F\x09\xFF\x10\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x09\x09\x00\x00\x00\x01\x00\x02\x01\xFF\x00\x03\x00\x00\x0A\x00\x00\x00\x00\x00\x00\x00\x00\x00"} err
+        assert_match "*Bad data format*" $err
+        r ping
+    }
+}
+
+test {corrupt payload: zipmap - element wouldn't fit in listpack} {
+    # Redis converts legacy zipmap encoded hashes to listpacks.
+    # This test creates a zipmap entry with a 1GB value which cannot
+    # fit into a listpack and verifies that RESTORE fails.
+
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no proto-max-bulk-len 2147483648 client-query-buffer-limit 2147483648]] {
+        proc zipmap_encode_len {len} {
+            if {$len < 254} {
+                return [binary format c $len]
+            } else {
+                return [binary format ci 254 $len]
+            }
+        }
+        r config set sanitize-dump-payload no
+
+        # Generates Zipmap with 1GB value - should fail lpSafeToAdd check
+        set val_len [expr {1024 * 1024 * 1024 + 1}]
+
+        # Zipmap has 1 element
+        set zm [binary format c 1]
+        # Field is 1 byte long
+        append zm [zipmap_encode_len 1]
+        append zm "k"
+        # Value is 1GB long
+        append zm [zipmap_encode_len $val_len]
+        append zm [binary format c 0]
+        append zm [string repeat "A" $val_len]
+        # ZIPMAP_END marker
+        append zm [binary format c 255]
+        # Prepend RDB header
+        set zm_len [string length $zm]
+        set rdb_len [binary format cI 0x80 $zm_len]
+        set dump [binary format c 9]
+        append dump $rdb_len
+        append dump $zm
+        append dump [binary format s 9]
+        append dump [binary format w 0]
+
+        catch {r RESTORE _hash 0 $dump} err
+        assert_match "*Bad data format*" $err
+    }
+} {} {large-memory}
+
+test {corrupt payload: zipmap - 5 bytes length encoding for a small field} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        catch {
+            r restore key 0 "\x09\x11\x01\xfe\x04\x00\x00\x00\x01\x00\xff\x00\x04\x00\x76\x61\x6c\x31\xff\x09\x00\xf9\xd5\xa4\xf7\x7d\x00\x3f\x1b"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: zipmap - 5 bytes length encoding for a small value} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no]] {
+        catch {
+            r restore key 0 "\x09\x0e\x01\x01\x6b\xfe\x04\x00\x00\x00\x00\x76\x61\x6c\x31\xff\x09\x00\xd0\xf9\xe4\x1d\xe4\xfb\x11\x4c"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: zipmap - 5 bytes length encoding and a huge field} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        catch {
+            r restore key 0 "\x09\x41\x15\x02\x04\x6b\x65\x79\x31\x04\x00\x76\x61\x6c\x31\xfe\x04\x00\x00\x00\xfe\xff\xff\xff\xfd\x00\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\x42\xff\x09\x00\x54\x2f\x0a\xca\x4e\x5c\x49\x9f"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+    }
+}
+
+test {corrupt payload: stream - duplicated consumer PEL entry} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        catch {
+            r restore key 0 "\x15\x01\x10\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\xc3\x39\x40\x42\x15\x42\x00\x00\x00\x11\x00\x02\x01\x00\x01\x01\x01\x86\x66\x69\x65\x6c\x64\x31\x07\x00\x01\x40\x0f\x0a\x00\x01\x86\x76\x61\x6c\x75\x65\x31\x07\x04\x20\x0b\x02\xcd\xd9\x02\xe0\x01\x22\x01\x32\x07\x80\x1a\x04\x32\x07\x06\x01\xff\x02\x81\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x81\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x02\x01\x07\x6d\x79\x67\x72\x6f\x75\x70\x81\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x02\x02\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x01\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x00\x00\x00\x00\x00\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x01\x01\x09\x63\x6f\x6e\x73\x75\x6d\x65\x72\x31\x80\xd9\x56\x0d\x9b\x01\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x02\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x4b\xe0\x99\x30\x67\x4d\xe5\x87"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Stream consumer PEL entry already has a consumer assigned*" 0
+    }
+}
+
+test {corrupt payload: stream with negative entries_added} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        # Stream with 3 entries (IDs 1-0, 2-0, 3-0) where entries_added is
+        # patched to 0xFFFFFFFF00000000 (exceeds INT64_MAX).  When cast to
+        # signed int64 for display via XINFO, this appears as -4294967296.
+        # The RDB loader must reject entries_added values that overflow.
+        catch {r RESTORE mystream 0 "\x15\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x33\x33\x00\x00\x00\x14\x00\x03\x01\x00\x01\x01\x01\x81\x66\x02\x00\x01\x02\x01\x00\x01\x00\x01\x81\x76\x02\x04\x01\x02\x01\x01\x01\x00\x01\x81\x76\x02\x04\x01\x02\x01\x02\x01\x00\x01\x81\x76\x02\x04\x01\xff\x03\x03\x00\x01\x00\x00\x00\x81\xff\xff\xff\xff\x00\x00\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Stream entries_added inconsistent with length*" 0
+    }
+}
+
+test {corrupt payload: stream consumer group with overflowing entries_read} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        r debug set-skip-checksum-validation 1
+        # Stream with 2 entries and a consumer group whose entries_read is
+        # patched to 0xFFFFFFFF00000000 (exceeds INT64_MAX and the stream's
+        # entries_added of 2).  The RDB loader must reject entries_read values
+        # that overflow or are inconsistent with entries_added.
+        catch {r RESTORE mystream 0 "\x15\x01\x10\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\xc3\x39\x40\x42\x15\x42\x00\x00\x00\x11\x00\x02\x01\x00\x01\x01\x01\x86\x66\x69\x65\x6c\x64\x31\x07\x00\x01\x40\x0f\x0a\x00\x01\x86\x76\x61\x6c\x75\x65\x31\x07\x04\x20\x0b\x02\xcd\xd9\x02\xe0\x01\x22\x01\x32\x07\x80\x1a\x04\x32\x07\x06\x01\xff\x02\x81\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x81\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x02\x01\x07\x6d\x79\x67\x72\x6f\x75\x70\x81\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x81\xff\xff\xff\xff\x00\x00\x00\x00\x02\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x01\x00\x00\x01\x9b\x0d\x56\xb7\x90\x00\x00\x00\x00\x00\x00\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x01\x01\x09\x63\x6f\x6e\x73\x75\x6d\x65\x72\x31\x80\xd9\x56\x0d\x9b\x01\x00\x00\x80\xd9\x56\x0d\x9b\x01\x00\x00\x02\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x9b\x0d\x56\xa9\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x4b\xe0\x99\x30\x67\x4d\xe5\x87"} err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*Stream cgroup entries_read inconsistent with entries_added*" 0
+    }
+}
+
+# Stream DUMP (RDB_TYPE_STREAM_LISTPACKS) with 6 entries (IDs 1-0..6-0,
+# field f). The first entry's flags element is stored as a 64-bit integer
+# (LP_ENCODING_64BIT_INT) instead of the minimal 7-bit encoding. CRC is stale;
+# tests skip checksum validation.
+set ::stream_nonminimal_flags "\x0f\x01\x10\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x40\x62\x62\x00\x00\x00\x23\x00\x06\x01\x00\x01\x01\x01\x81\x66\x02\x00\x01\xf4\x02\x00\x00\x00\x00\x00\x00\x00\x09\x00\x01\x00\x01\x82\x76\x30\x03\x04\x01\x02\x01\x01\x01\x00\x01\x82\x76\x31\x03\x04\x01\x02\x01\x02\x01\x00\x01\x82\x76\x32\x03\x04\x01\x02\x01\x03\x01\x00\x01\x82\x76\x33\x03\x04\x01\x02\x01\x04\x01\x00\x01\x82\x76\x34\x03\x04\x01\x02\x01\x05\x01\x00\x01\x82\x76\x35\x03\x04\x01\xff\x06\x06\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+test {corrupt payload: stream XTRIM with non-minimally encoded flags} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload yes
+        r debug set-skip-checksum-validation 1
+        assert_equal {OK} [r restore key 0 $::stream_nonminimal_flags]
+        assert_equal 6 [r xlen key]
+        r xtrim key maxlen 1
+        assert_equal 1 [r xlen key]
+        r ping
+    }
+}
+
+} ;# tags
